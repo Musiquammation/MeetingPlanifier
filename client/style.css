@@ -289,3 +289,13 @@ input, select, textarea { max-width: 100%; }
 @media (prefers-reduced-motion: no-preference) {
   button, a, input, select, textarea { transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease; }
 }
+
+/* Draguer sur un événement crée un nouveau créneau superposé */
+[data-cal] [data-event] {
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+[data-cal] [data-event]:active { cursor: crosshair; }
+[data-cal] [data-select] { z-index: 5; }

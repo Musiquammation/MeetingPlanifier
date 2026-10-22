@@ -25,7 +25,7 @@ export interface CalSettings {
 
 interface Placed { ev: CalEvent; s: number; e: number; min: number; len: number; lane: number; lanes: number }
 interface Selection { day: Date; from: number; to: number } // minutes since midnight
-interface Drag { day: Date; col: HTMLElement; y0: number; moved: boolean; mouse: boolean }
+interface Drag { day: Date; col: HTMLElement; captureEl: HTMLElement; y0: number; y0Raw: number; moved: boolean; mouse: boolean; pointerId: number }
 
 // ---- Date helpers (shared with DomHandler) ----------------------------------
 export const startOfDay = (d: Date) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
@@ -62,6 +62,7 @@ export class Calendar {
 	private drag: Drag | null = null;
 	private swipe: { x: number; y: number } | null = null;
 	private attached = false;
+	private suppressEventClickUntil = 0;
 
 	/** Wires media query + clock. Safe to call several times. */
 	attach(onRange: () => void): void {
@@ -203,40 +204,58 @@ export class Calendar {
 		const raw = lo + ((e.clientY - r.top) / r.height) * (hi + STEP - lo);
 		return Math.min(hi, Math.max(lo, Math.floor(raw / STEP) * STEP));
 	}
+	private rawMinutesAt(e: PointerEvent, col: HTMLElement): number {
+		const r = col.getBoundingClientRect();
+		const lo = this.settings.startHour * 60;
+		const hi = this.settings.endHour * 60;
+		return Math.min(hi, Math.max(lo, lo + ((e.clientY - r.top) / r.height) * (hi - lo)));
+	}
 
 	down(e: PointerEvent, day: Date) {
 		const target = e.target as HTMLElement;
-		if (target.closest("[data-event]")) return; // events handle their own click
+		const eventEl = target.closest<HTMLElement>("[data-event]");
 		const mouse = e.pointerType === "mouse";
 		if (mouse && e.button !== 0) return;
-		const col = e.currentTarget as HTMLElement;
-		this.drag = { day, col, y0: this.minutesAt(e, col), moved: false, mouse };
+		// Draguer depuis un événement dessine un nouveau créneau par-dessus.
+		// Un simple clic conserve l'ouverture normale du détail.
+		const col = (eventEl?.closest("[data-day]") ?? e.currentTarget) as HTMLElement;
+		const captureEl = eventEl ?? col;
+		const y0Raw = this.rawMinutesAt(e, col);
+		this.drag = { day, col, captureEl, y0: this.minutesAt(e, col), y0Raw, moved: false, mouse, pointerId: e.pointerId };
 		this.selection = null;
-		col.setPointerCapture(e.pointerId);
+		try { captureEl.setPointerCapture(e.pointerId); } catch { /* capture parfois déjà gérée par le navigateur */ }
 	}
 
 	move(e: PointerEvent) {
 		const d = this.drag;
-		if (!d) return;
+		if (!d || d.pointerId !== e.pointerId) return;
+		const raw = this.rawMinutesAt(e, d.col);
 		const m = this.minutesAt(e, d.col);
-		if (m !== d.y0) d.moved = true;
-		if (d.moved) this.selection = { day: d.day, from: Math.min(d.y0, m), to: Math.max(d.y0, m) + STEP };
+		// Under or equal to 15 minutes is a normal click/selection, not creation.
+		if (Math.abs(raw - d.y0Raw) > 15) d.moved = true;
+		if (d.moved) {
+			this.selection = { day: d.day, from: Math.min(d.y0, m), to: Math.max(d.y0, m) + STEP };
+			e.preventDefault();
+		}
 	}
 
 	up(e: PointerEvent) {
 		const d = this.drag;
 		this.drag = null;
-		if (!d) return;
-		if (d.col.hasPointerCapture(e.pointerId)) d.col.releasePointerCapture(e.pointerId);
-		// A click or a tap (no drag) selects one hour by default.
-		const sel = this.selection && d.moved ? this.selection : { day: d.day, from: d.y0, to: d.y0 + 60 };
-		this.selection = sel;
+		if (!d || d.pointerId !== e.pointerId) return;
+		if (d.captureEl.hasPointerCapture(e.pointerId)) d.captureEl.releasePointerCapture(e.pointerId);
+		// Sans déplacement, on laisse le clic ouvrir l'événement.
+		if (!d.moved || !this.selection) { this.selection = null; return; }
+		this.suppressEventClickUntil = Date.now() + 500;
+		const sel = this.selection;
 		const start = new Date(d.day); start.setHours(0, sel.from, 0, 0);
 		const end = new Date(d.day); end.setHours(0, sel.to, 0, 0);
 		this.onSelect?.(start, end);
 	}
 
-	cancel() { this.drag = null; }
+	shouldSuppressEventClick(): boolean { return Date.now() < this.suppressEventClickUntil; }
+
+	cancel() { this.drag = null; this.selection = null; }
 
 	// ---- Swipe (an extra way to change day, never the only one) ---------
 	swipeStart(e: TouchEvent) { const t = e.changedTouches[0]; this.swipe = { x: t.clientX, y: t.clientY }; }

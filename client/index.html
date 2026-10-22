@@ -543,9 +543,9 @@
 					</ol>
 					<template x-for="d in cal.days" :key="cal.key(d)">
 						<div data-day role="group" :aria-label="cal.longDay(d)" :data-today="cal.isToday(d)"
-							@pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()" @dragover.prevent @drop="dropEvent($event, d)">
+							@pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()">
 							<template x-for="p in cal.layoutFor(d)" :key="p.ev.id">
-								<button type="button" data-event :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" :draggable="p.ev.editable && (p.ev.kind === 'dispo' || p.ev.kind === 'suggestion')" @dragstart="dragCalendarEvent($event, p.ev)" @click="openEvent(p.ev)"
+								<button type="button" data-event :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" @pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
 									:aria-label="kindLabel(p.ev.kind) + ', ' + p.ev.title + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
 									<b x-text="kindLabel(p.ev.kind)"></b>
 									<span x-text="p.ev.title"></span>
