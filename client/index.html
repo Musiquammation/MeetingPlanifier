@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="fr">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+	<title>Planning – rendez-vous et salles</title>
+	<link rel="stylesheet" href="./style.css">
+	<script type="module" src="./src/index.ts"></script>
+</head>
+<body x-data="app" x-cloak @keydown.escape.window="closePanel()">
+
+<header>
+	<a href="#main" data-brand>Planning</a>
+	<nav aria-label="Navigation principale">
+		<template x-if="role === 'admin'">
+			<ul>
+				<li><a href="#admin-dashboard" :aria-current="page === 'admin-dashboard' ? 'page' : null">Tableau de bord</a></li>
+				<li><a href="#admin-companies" :aria-current="page === 'admin-companies' ? 'page' : null">Société</a></li>
+				<li><a href="#admin-consumers" :aria-current="page === 'admin-consumers' ? 'page' : null">Consommateurs</a></li>
+				<li><a href="#admin-agents" :aria-current="page === 'admin-agents' ? 'page' : null">Agents</a></li>
+				<li><a href="#admin-rooms" :aria-current="page === 'admin-rooms' ? 'page' : null">Salles</a></li>
+			</ul>
+		</template>
+		<template x-if="role === 'agent'">
+			<ul>
+				<li><a href="#agent-dashboard" :aria-current="page === 'agent-dashboard' ? 'page' : null">Tableau de bord</a></li>
+				<li><a href="#agent-companies" :aria-current="page === 'agent-companies' ? 'page' : null">Sociétés</a></li>
+				<li><a href="#agent-consumers" :aria-current="page === 'agent-consumers' ? 'page' : null">Consommateurs</a></li>
+				<li><a href="#agent-agenda" :aria-current="page === 'agent-agenda' ? 'page' : null">Agenda</a></li>
+			</ul>
+		</template>
+		<template x-if="role === 'consumer'">
+			<ul>
+				<li><a href="#consumer-dashboard" :aria-current="page === 'consumer-dashboard' ? 'page' : null">Tableau de bord</a></li>
+				<li><a href="#consumer-agenda" :aria-current="page === 'consumer-agenda' ? 'page' : null">Agenda</a></li>
+			</ul>
+		</template>
+	</nav>
+	<template x-if="role">
+		<button type="button" @click="logout()">Déconnexion</button>
+	</template>
+</header>
+
+<main>
+	<template x-if="error"><p role="alert" data-tone="error" x-text="error"></p></template>
+	<template x-if="notice"><p role="status" data-tone="ok" x-text="notice"></p></template>
+	<template x-if="!ready"><p>Chargement…</p></template>
+
+	<!-- ============ Home ============ -->
+	<template x-if="page === 'main'">
+		<section>
+			<h1>Planifiez vos rendez-vous, sans aller-retour</h1>
+			<p>Les consommateurs indiquent quand ils sont libres, les agents proposent leurs horaires, et chaque rendez-vous est placé dans le bon créneau et la bonne salle.</p>
+			<ul data-choices>
+				<li><a href="#consumer-welcome"><b>Je suis consommateur</b><span>J’ai reçu une clé d’accès</span></a></li>
+				<li><a href="#agent-welcome"><b>Je suis agent</b><span>Je gère mes horaires et mes rendez-vous</span></a></li>
+				<li><a href="#admin-welcome"><b>Je suis administrateur</b><span>Je gère ma société, mes agents et mes salles</span></a></li>
+			</ul>
+		</section>
+	</template>
+
+	<!-- ============ Admin: public pages ============ -->
+	<template x-if="page === 'admin-welcome'">
+		<section>
+			<h1>Espace administrateur</h1>
+			<p>Créez votre société, ajoutez vos agents et vos consommateurs, et gérez vos salles.</p>
+			<p data-actions><a href="#admin-login" data-button>Se connecter</a> <a href="#admin-signup">Créer une société</a></p>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-login'">
+		<section>
+			<h1>Connexion administrateur</h1>
+			<form @submit.prevent="adminLogin()">
+				<label>Nom d’utilisateur <input x-model="form.username" autocomplete="username" required maxlength="80"></label>
+				<label>Mot de passe <input type="password" x-model="form.password" autocomplete="current-password" required></label>
+				<button type="submit" :disabled="busy" x-text="busy ? 'Connexion…' : 'Se connecter'"></button>
+			</form>
+			<p><a href="#admin-signup">Pas encore de société ? Créez-en une</a></p>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-signup'">
+		<section>
+			<h1>Créer une société</h1>
+			<form @submit.prevent="adminSignup()">
+				<label>Votre nom <input x-model="form.displayName" autocomplete="name" required maxlength="120"></label>
+				<label>Nom de la société <input x-model="form.companyName" autocomplete="organization" required maxlength="120"></label>
+				<label>Nom d’utilisateur <input x-model="form.username" autocomplete="username" required maxlength="80"></label>
+				<label>Mot de passe <input type="password" x-model="form.password" autocomplete="new-password" required></label>
+				<button type="submit" :disabled="busy" x-text="busy ? 'Création…' : 'Créer la société'"></button>
+			</form>
+		</section>
+	</template>
+
+	<!-- ============ Admin: private pages ============ -->
+	<template x-if="page === 'admin-dashboard'">
+		<section>
+			<h1 x-text="company ? company.name : 'Tableau de bord'"></h1>
+			<dl data-stats>
+				<div><dt>Consommateurs</dt><dd x-text="consumers.length"></dd></div>
+				<div><dt>Agents</dt><dd x-text="agents.length"></dd></div>
+				<div><dt>Rendez-vous à venir</dt><dd x-text="upcoming().length"></dd></div>
+			</dl>
+			<p data-actions><a href="#admin-consumers" data-button>Inscrire un consommateur</a> <a href="#admin-agents">Gérer les agents</a> <a href="#admin-rooms">Gérer les salles</a></p>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-companies'">
+		<section>
+			<h1>Société</h1>
+			<template x-if="!loading && !companies.length"><p>Aucune société n’est rattachée à ce compte.</p></template>
+			<ul>
+				<template x-for="c in companies" :key="c.id">
+					<li><b x-text="c.name"></b></li>
+				</template>
+			</ul>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-consumers'">
+		<section>
+			<h1>Consommateurs</h1>
+			<template x-if="created">
+				<aside data-key role="status">
+					<p><b x-text="created.consumer.name + ' ' + (created.consumer.surname ?? '')"></b> peut se connecter avec cette clé d’accès :</p>
+					<output x-text="created.fidelity.key"></output>
+					<p>Transmettez-la au consommateur : elle ne s’affiche qu’ici.</p>
+				</aside>
+			</template>
+
+			<h2>1. Chercher un consommateur existant</h2>
+			<form @submit.prevent="searchConsumers()" role="search">
+				<label>Nom, prénom ou nom d’utilisateur <input type="search" x-model="form.q" required></label>
+				<button type="submit" :disabled="busy">Rechercher</button>
+			</form>
+			<template x-if="results.length">
+				<div role="region" tabindex="0" aria-label="Résultats de la recherche">
+					<table>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th></th></tr></thead>
+						<tbody>
+							<template x-for="c in results" :key="c.id">
+								<tr>
+									<td x-text="c.name + ' ' + c.surname"></td>
+									<td x-text="c.username"></td>
+									<td><button type="button" @click="enroll(c)" :disabled="busy">Inscrire à ma société</button></td>
+								</tr>
+							</template>
+						</tbody>
+					</table>
+				</div>
+			</template>
+
+			<h2>2. Sinon, en créer un</h2>
+			<form @submit.prevent="createConsumer()">
+				<label>Prénom <input x-model="form.name" required maxlength="100"></label>
+				<label>Nom <input x-model="form.surname" required maxlength="100"></label>
+				<label>Nom d’utilisateur <input x-model="form.username" required maxlength="80"></label>
+				<label>Mot de passe (facultatif : sans mot de passe, la clé suffit) <input type="password" x-model="form.password" autocomplete="new-password"></label>
+				<button type="submit" :disabled="busy">Créer et inscrire</button>
+			</form>
+
+			<h2>Consommateurs de ma société</h2>
+			<template x-if="!loading && !consumers.length"><p>Aucun consommateur pour l’instant. Cherchez-en un ci-dessus ou créez-en un.</p></template>
+			<template x-if="consumers.length">
+				<div role="region" tabindex="0" aria-label="Consommateurs">
+					<table>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Clé d’accès</th></tr></thead>
+						<tbody>
+							<template x-for="c in consumers" :key="consumerKey(c)">
+								<tr><td x-text="consumerLabel(c)"></td><td x-text="consumerOf(c).username"></td><td x-text="fidelityKey(c)"></td></tr>
+							</template>
+						</tbody>
+					</table>
+				</div>
+			</template>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-agents'">
+		<section>
+			<h1>Agents</h1>
+
+			<h2>1. Chercher un agent existant</h2>
+			<form @submit.prevent="searchAgents()" role="search">
+				<label>Nom, prénom ou nom d’utilisateur <input type="search" x-model="form.q" required></label>
+				<button type="submit" :disabled="busy">Rechercher</button>
+			</form>
+			<template x-if="searched && !agentResults.length"><p>Aucun agent trouvé.</p></template>
+			<template x-if="agentResults.length">
+				<div role="region" tabindex="0" aria-label="Résultats de la recherche">
+					<table>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th></th></tr></thead>
+						<tbody>
+							<template x-for="a in agentResults" :key="a.id">
+								<tr>
+									<td x-text="agentLabel(a)"></td>
+									<td x-text="a.username"></td>
+									<td>
+										<template x-if="inCompany(a)"><span>Déjà dans ma société</span></template>
+										<template x-if="!inCompany(a)"><button type="button" @click="attachAgent(a)" :disabled="busy">Rattacher à ma société</button></template>
+									</td>
+								</tr>
+							</template>
+						</tbody>
+					</table>
+				</div>
+			</template>
+
+			<h2>2. Sinon, en créer un</h2>
+			<form @submit.prevent="createAgent()">
+				<label>Prénom <input x-model="form.name" required maxlength="100"></label>
+				<label>Nom <input x-model="form.surname" required maxlength="100"></label>
+				<label>Nom d’utilisateur <input x-model="form.username" required maxlength="80"></label>
+				<label>Mot de passe <input type="password" x-model="form.password" autocomplete="new-password" required></label>
+				<button type="submit" :disabled="busy">Créer l’agent</button>
+			</form>
+
+			<h2>Assigner un agent à un consommateur</h2>
+			<form @submit.prevent="assign()">
+				<label>Agent
+					<select x-model="form.agentId" required>
+						<option value="">Choisir…</option>
+						<template x-for="a in agents" :key="a.id"><option :value="a.id" x-text="agentLabel(a)"></option></template>
+					</select>
+				</label>
+				<label>Consommateur
+					<select x-model="form.fidelityId" required>
+						<option value="">Choisir…</option>
+						<template x-for="c in consumers" :key="fidelityId(c)"><option :value="fidelityId(c)" x-text="consumerLabel(c)"></option></template>
+					</select>
+				</label>
+				<button type="submit" :disabled="busy">Assigner</button>
+			</form>
+
+			<h2>Agents de ma société</h2>
+			<template x-if="!loading && !agents.length"><p>Aucun agent pour l’instant.</p></template>
+			<template x-if="agents.length">
+				<div role="region" tabindex="0" aria-label="Agents de ma société">
+					<table>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Consommateurs assignés</th><th></th></tr></thead>
+						<template x-for="a in agents" :key="a.id">
+							<tbody>
+								<tr>
+									<td x-text="agentLabel(a)"></td>
+									<td x-text="a.username"></td>
+									<td x-text="assignationsOf(a).length"></td>
+									<td>
+										<button type="button" @click="toggleAgent(a)" :aria-expanded="openAgent === a.id" x-text="openAgent === a.id ? 'Masquer' : 'Consulter'"></button>
+										<button type="button" data-variant="danger" @click="removeAgent(a)" :disabled="busy">Retirer</button>
+									</td>
+								</tr>
+								<template x-for="x in (openAgent === a.id ? assignationsOf(a) : [])" :key="x.id">
+									<tr data-sub>
+										<td x-text="'↳ ' + consumerLabel(x)"></td>
+										<td x-text="consumerOf(x).username"></td>
+										<td></td>
+										<td><button type="button" data-variant="danger" @click="removeAssignation(x)" :disabled="busy">Supprimer</button></td>
+									</tr>
+								</template>
+								<template x-if="openAgent === a.id && !assignationsOf(a).length">
+									<tr data-sub><td colspan="4">Aucun consommateur assigné.</td></tr>
+								</template>
+							</tbody>
+						</template>
+					</table>
+				</div>
+			</template>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-rooms'">
+		<section>
+			<h1>Salles</h1>
+			<form @submit.prevent="createRoom()">
+				<label>Nom de la salle <input x-model="form.name" required maxlength="100"></label>
+				<label>Nombre de cours en même temps (-1 = illimité) <input type="number" min="-1" step="1" x-model="form.limit" placeholder="-1"></label>
+				<button type="submit" :disabled="busy">Ajouter la salle</button>
+			</form>
+			<template x-if="!loading && !rooms.length"><p>Aucune salle. Ajoutez la première ci-dessus.</p></template>
+			<template x-if="rooms.length">
+				<div role="region" tabindex="0" aria-label="Salles">
+					<table>
+						<thead><tr><th>Nom</th><th>Limite</th><th>État</th><th></th></tr></thead>
+						<tbody>
+							<template x-for="r in rooms" :key="r.name">
+								<tr>
+									<td><input x-model="r.draftName" :aria-label="'Nom de ' + r.name" maxlength="100"></td>
+									<td><input type="number" min="-1" step="1" x-model.number="r.draftLimit" :aria-label="'Limite de ' + r.name"></td>
+									<td x-text="r.active === false ? 'Désactivée' : 'Active'"></td>
+									<td>
+										<button type="button" @click="saveRoom(r)" :disabled="busy">Enregistrer</button>
+										<button type="button" data-variant="danger" @click="deactivateRoom(r)" :disabled="busy || r.active === false">Désactiver</button>
+									</td>
+								</tr>
+							</template>
+						</tbody>
+					</table>
+				</div>
+			</template>
+		</section>
+	</template>
+
+	<!-- ============ Agent: public pages ============ -->
+	<template x-if="page === 'agent-welcome'">
+		<section>
+			<h1>Espace agent</h1>
+			<p>Publiez vos horaires, consultez les disponibilités de vos consommateurs et créez vos rendez-vous.</p>
+			<p data-actions><a href="#agent-login" data-button>Se connecter</a> <a href="#agent-signup">Je n’ai pas de compte</a></p>
+		</section>
+	</template>
+
+	<template x-if="page === 'agent-login'">
+		<section>
+			<h1>Connexion agent</h1>
+			<form @submit.prevent="agentLogin()">
+				<label>Nom d’utilisateur <input x-model="form.username" autocomplete="username" required maxlength="80"></label>
+				<label>Mot de passe <input type="password" x-model="form.password" autocomplete="current-password" required></label>
+				<button type="submit" :disabled="busy" x-text="busy ? 'Connexion…' : 'Se connecter'"></button>
+			</form>
+		</section>
+	</template>
+
+	<template x-if="page === 'agent-signup'">
+		<section>
+			<h1>Obtenir un compte agent</h1>
+			<p>Un compte agent est créé par l’administrateur de votre société, qui vous rattache à celle-ci. Demandez-lui de le créer, puis connectez-vous avec les identifiants qu’il vous communique.</p>
+			<p data-actions><a href="#agent-login" data-button>Se connecter</a></p>
+		</section>
+	</template>
+
+	<!-- ============ Agent: private pages ============ -->
+	<template x-if="page === 'agent-dashboard'">
+		<section>
+			<h1>Tableau de bord</h1>
+			<dl data-stats>
+				<div><dt>Sociétés</dt><dd x-text="contracts.length"></dd></div>
+				<div><dt>Disponibilités à traiter</dt><dd x-text="dispos.length"></dd></div>
+				<div><dt>Rendez-vous à venir</dt><dd x-text="upcoming().length"></dd></div>
+			</dl>
+			<p data-actions><a href="#agent-agenda" data-button>Ouvrir l’agenda</a></p>
+		</section>
+	</template>
+
+	<template x-if="page === 'agent-companies'">
+		<section>
+			<h1>Mes sociétés</h1>
+			<template x-if="!loading && !companies.length"><p>Aucun contrat actif. Votre administrateur doit vous rattacher à une société.</p></template>
+			<ul>
+				<template x-for="c in companies" :key="c.id"><li><b x-text="c.name"></b></li></template>
+			</ul>
+		</section>
+	</template>
+
+	<template x-if="page === 'agent-consumers'">
+		<section>
+			<h1>Mes consommateurs</h1>
+			<template x-if="!loading && !assignations.length"><p>Aucun consommateur ne vous est encore assigné.</p></template>
+			<template x-if="assignations.length">
+				<div role="region" tabindex="0" aria-label="Mes consommateurs">
+					<table>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Société</th><th></th></tr></thead>
+						<tbody>
+							<template x-for="x in assignations" :key="x.id">
+								<tr>
+									<td x-text="consumerLabel(x)"></td>
+									<td x-text="consumerOf(x).username"></td>
+									<td x-text="x.companyName"></td>
+									<td><button type="button" @click="showOnly(x.id)">Voir ses disponibilités</button></td>
+								</tr>
+							</template>
+						</tbody>
+					</table>
+				</div>
+			</template>
+		</section>
+	</template>
+
+	<!-- ============ Consumer: public pages ============ -->
+	<template x-if="page === 'consumer-welcome'">
+		<section>
+			<h1>Espace consommateur</h1>
+			<p>Choisissez vos créneaux auprès des agents qui vous suivent. Vous avez besoin de la clé à 6 caractères remise par votre administrateur.</p>
+			<p data-actions><a href="#consumer-access" data-button>Saisir ma clé</a></p>
+		</section>
+	</template>
+
+	<template x-if="page === 'consumer-access'">
+		<section>
+			<h1>Accéder à mon espace</h1>
+			<form @submit.prevent="consumerAccess()">
+				<label>Clé d’accès (6 caractères) <input x-model="form.key" maxlength="6" minlength="6" autocomplete="off" autocapitalize="off" spellcheck="false" required></label>
+				<label>Mot de passe <small>(seulement si votre compte en a un)</small> <input type="password" x-model="form.password" autocomplete="current-password"></label>
+				<button type="submit" :disabled="busy" x-text="busy ? 'Vérification…' : 'Accéder'"></button>
+			</form>
+		</section>
+	</template>
+
+	<!-- ============ Consumer: private pages ============ -->
+	<template x-if="page === 'consumer-dashboard'">
+		<section>
+			<h1>Bonjour <span x-text="user ? user.name : ''"></span></h1>
+			<h2>Mes agents</h2>
+			<template x-if="!loading && !agentsList.length"><p>Aucun agent ne vous est encore assigné. Contactez votre administrateur.</p></template>
+			<ul>
+				<template x-for="a in agentsList" :key="assignId(a)">
+					<li>
+						<b x-text="agentLabel(a)"></b>
+						<small x-text="a.company ? a.company.name : ''"></small>
+						<template x-for="r in requests.filter(x => x.assignationId === assignId(a))" :key="r.id">
+							<span x-text="progress(r)"></span>
+						</template>
+					</li>
+				</template>
+			</ul>
+			<p data-actions><a href="#consumer-agenda" data-button>Choisir mes créneaux</a></p>
+		</section>
+	</template>
+
+	<!-- ============ Dashboards: upcoming meetings (shared) ============ -->
+	<template x-if="page.endsWith('-dashboard')">
+		<section>
+			<h2>Prochains rendez-vous</h2>
+			<template x-if="!loading && !upcoming().length"><p>Aucun rendez-vous à venir dans les 14 prochains jours.</p></template>
+			<template x-if="upcoming().length">
+				<div role="region" tabindex="0" aria-label="Prochains rendez-vous">
+					<table>
+						<thead><tr><th>Date</th><th>Durée</th><th>Salle</th><th>Statut</th></tr></thead>
+						<tbody>
+							<template x-for="m in upcoming()" :key="m.id">
+								<tr><td x-text="fmt(m.startAt)"></td><td x-text="m.durationMinutes + ' min'"></td><td x-text="roomOf(m)"></td><td x-text="statusLabel(m.status)"></td></tr>
+							</template>
+						</tbody>
+					</table>
+				</div>
+			</template>
+		</section>
+	</template>
+
+	<!-- ============ Agendas (agent and consumer share the same panel) ============ -->
+	<template x-if="page === 'agent-agenda' || page === 'consumer-agenda'">
+		<section data-cal x-place="{'--days': cal.days.length, '--hours': cal.hours.length}" x-init="$nextTick(() => cal.scrollToNow($refs.scroller))">
+			<h1 x-text="page === 'agent-agenda' ? 'Agenda' : 'Mon agenda'"></h1>
+
+			<template x-if="page === 'consumer-agenda'">
+				<div data-request>
+					<template x-if="!agentsList.length && !loading"><p>Aucun agent ne vous est encore assigné.</p></template>
+					<template x-if="agentsList.length">
+						<label>Agent
+							<select @change="selectAgent($event.target.value)">
+								<template x-for="a in agentsList" :key="assignId(a)">
+									<option :value="assignId(a)" :selected="assignId(a) === selAssign" x-text="agentLabel(a)"></option>
+								</template>
+							</select>
+						</label>
+					</template>
+					<template x-if="agentsList.length && currentRequest()">
+						<p>Ma demande : <b x-text="progress(currentRequest())"></b>. Touchez ou sélectionnez un créneau libre pour ajouter une disponibilité.</p>
+					</template>
+					<template x-if="agentsList.length && !currentRequest()">
+						<form @submit.prevent="createRequest()">
+							<p>Vous pouvez ajouter vos disponibilités directement dans l’agenda. Si vous le souhaitez, vous pouvez aussi limiter le nombre d’heures :</p>
+							<label>Nombre d’heures souhaitées (facultatif) <input type="number" min="0.5" step="0.5" x-model="form.hours"></label>
+							<button type="submit" :disabled="busy || !form.hours">Enregistrer ma demande</button>
+						</form>
+					</template>
+				</div>
+			</template>
+
+			<template x-if="page === 'agent-agenda' && assignations.length">
+				<fieldset data-consumers>
+					<legend>Disponibilités des consommateurs</legend>
+					<label><input type="checkbox" :checked="assignations.every(x => isShown(x.id))" @change="setAllConsumers($event.target.checked)"> Tous</label>
+					<template x-for="x in assignations" :key="x.id">
+						<label><input type="checkbox" :checked="isShown(x.id)" @change="toggleConsumer(x.id)"> <span x-text="consumerLabel(x)"></span></label>
+					</template>
+				</fieldset>
+			</template>
+
+			<div role="toolbar" aria-label="Navigation de l’agenda" data-toolbar>
+				<div role="group" aria-label="Période">
+					<button type="button" @click="cal.prev()" aria-label="Période précédente">‹</button>
+					<button type="button" @click="cal.today()">Aujourd’hui</button>
+					<button type="button" @click="cal.next()" aria-label="Période suivante">›</button>
+				</div>
+				<p data-range aria-live="polite" x-text="cal.title"></p>
+				<div role="group" aria-label="Affichage">
+					<button type="button" @click="cal.setView('day')" :aria-pressed="cal.settings.mode === 'days' && cal.count === 1">Jour</button>
+					<button type="button" @click="cal.setView('week')" :aria-pressed="cal.settings.mode === 'week'">Semaine</button>
+				</div>
+				<label>Aller à <input type="date" @change="cal.goTo($event.target.value)"></label>
+				<button type="button" @click="openCreate()" x-text="page === 'agent-agenda' ? 'Ajouter mes horaires' : 'Ajouter une disponibilité'"></button>
+			</div>
+
+			<details data-settings>
+				<summary>Réglages de l’agenda</summary>
+				<form @submit.prevent @change="cal.apply()">
+					<label>Affichage
+						<select x-model="cal.settings.mode">
+							<option value="week">Semaine entière</option>
+							<option value="days">À partir de la date choisie</option>
+						</select>
+					</label>
+					<label>Nombre de jours affichés
+						<select x-model.number="cal.settings.daysCount">
+							<template x-for="n in [1, 2, 3, 4, 5, 6, 7]" :key="n"><option :value="n" x-text="n"></option></template>
+						</select>
+					</label>
+					<label>Premier jour de la semaine
+						<select x-model.number="cal.settings.firstDay">
+							<option value="1">Lundi</option>
+							<option value="6">Samedi</option>
+							<option value="0">Dimanche</option>
+						</select>
+					</label>
+					<label>Début de journée (h) <input type="number" min="0" max="22" x-model.number="cal.settings.startHour"></label>
+					<label>Fin de journée (h) <input type="number" min="1" max="24" x-model.number="cal.settings.endHour"></label>
+					<p>Sur un petit écran, un seul jour est affiché.</p>
+					<button type="button" @click="cal.reset()">Rétablir les valeurs par défaut</button>
+				</form>
+			</details>
+
+			<ul data-legend aria-label="Légende">
+				<li><i data-kind="slot"></i> Horaires de l’agent</li>
+				<li><i data-kind="suggestion"></i> Suggestion</li>
+				<li><i data-kind="dispo"></i> Disponibilité</li>
+				<li><i data-kind="meeting" data-status="pending"></i> Rendez-vous en attente</li>
+				<li><i data-kind="meeting" data-status="done"></i> Rendez-vous terminé</li>
+			</ul>
+
+			<div data-scroll x-ref="scroller" @touchstart.passive="cal.swipeStart($event)" @touchend="cal.swipeEnd($event)" :aria-busy="loading">
+				<div data-head>
+					<span></span>
+					<template x-for="d in cal.days" :key="cal.key(d)">
+						<button type="button" data-day-head :data-today="cal.isToday(d)" @click="cal.focusDay(d)" :aria-label="'Afficher uniquement ' + cal.longDay(d)">
+							<span x-text="cal.dayName(d)"></span><b x-text="cal.dayNum(d)"></b>
+						</button>
+					</template>
+				</div>
+				<div data-grid>
+					<ol data-hours aria-hidden="true">
+						<template x-for="h in cal.hours" :key="h"><li x-text="h + ' h'"></li></template>
+					</ol>
+					<template x-for="d in cal.days" :key="cal.key(d)">
+						<div data-day role="group" :aria-label="cal.longDay(d)" :data-today="cal.isToday(d)"
+							@pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()" @dragover.prevent @drop="dropEvent($event, d)">
+							<template x-for="p in cal.layoutFor(d)" :key="p.ev.id">
+								<button type="button" data-event :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" :draggable="p.ev.editable && (p.ev.kind === 'dispo' || p.ev.kind === 'suggestion')" @dragstart="dragCalendarEvent($event, p.ev)" @click="openEvent(p.ev)"
+									:aria-label="kindLabel(p.ev.kind) + ', ' + p.ev.title + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
+									<b x-text="kindLabel(p.ev.kind)"></b>
+									<span x-text="p.ev.title"></span>
+									<time x-text="cal.time(p.ev.start) + ' – ' + cal.time(p.ev.end)"></time>
+								</button>
+							</template>
+							<template x-if="cal.selectionFor(d)">
+								<div data-select x-place="cal.selectionFor(d)"><span x-text="cal.selectionLabel()"></span></div>
+							</template>
+							<template x-if="cal.nowMin(d) !== null">
+								<div data-now x-place="{'--start': cal.nowMin(d)}"></div>
+							</template>
+						</div>
+					</template>
+				</div>
+			</div>
+
+			<!-- Cancelled meetings are kept out of the grid and listed here -->
+			<section data-cancelled aria-labelledby="cancelled-title">
+				<h2 id="cancelled-title">Rendez-vous annulés</h2>
+				<template x-if="!cancelledMeetings().length"><p>Aucun rendez-vous annulé sur cette période.</p></template>
+				<template x-if="cancelledMeetings().length">
+					<ul>
+						<template x-for="m in cancelledMeetings()" :key="m.id">
+							<li>
+								<button type="button" @click="openMeeting(m)">
+									<span x-text="fmt(m.startAt) + ' · ' + m.durationMinutes + ' min'"></span>
+									<template x-if="role === 'agent'"><span x-text="' — ' + who(m.assignationId)"></span></template>
+								</button>
+							</li>
+						</template>
+					</ul>
+				</template>
+			</section>
+
+			<!-- Detail / edit panel (side panel on desktop, bottom sheet on mobile) -->
+			<template x-if="panel">
+				<aside role="dialog" aria-modal="true" aria-label="Détail du créneau">
+					<button type="button" data-variant="close" @click="closePanel()" aria-label="Fermer">×</button>
+					<template x-if="panel.error"><p role="alert" data-tone="error" x-text="panel.error"></p></template>
+
+					<template x-if="panel.type === 'interval'">
+						<form @submit.prevent="submitInterval()">
+							<h2 x-text="panel.form.id ? 'Modifier le créneau' : (role === 'agent' ? 'Ajouter mes horaires' : 'Ajouter une disponibilité')"></h2>
+							<template x-if="role === 'agent' && contracts.length > 1">
+								<label>Société
+									<select x-model.number="panel.form.contractId" :disabled="!!panel.form.id">
+										<template x-for="c in contracts" :key="c.id"><option :value="c.id" x-text="contractLabel(c)"></option></template>
+									</select>
+								</label>
+							</template>
+							<label>Début <input type="datetime-local" x-model="panel.form.start" step="900" required></label>
+							<label>Durée (minutes) <input type="number" min="15" step="15" x-model="panel.form.duration" required></label>
+							<label>Préférence : <output x-text="Math.round(panel.form.love * 100) + ' %'"></output>
+								<input type="range" min="0" max="1" step="0.1" x-model="panel.form.love">
+								<small>0 % : possible en dernier recours · 100 % : idéal</small>
+							</label>
+							<p data-actions>
+								<button type="submit" :disabled="busy">Enregistrer</button>
+								<template x-if="panel.form.id"><button type="button" data-variant="danger" @click="deleteInterval()" :disabled="busy">Supprimer</button></template>
+							</p>
+						</form>
+					</template>
+
+					<template x-if="panel.type === 'slot'">
+						<div>
+							<h2>Horaires de l’agent</h2>
+							<p x-text="fmt(panel.ev.raw.startAt) + ' · ' + panel.ev.raw.durationMinutes + ' min'"></p>
+							<p data-actions><button type="button" @click="useSlot()">Proposer une disponibilité ici</button></p>
+						</div>
+					</template>
+
+					<template x-if="panel.type === 'book'">
+						<form @submit.prevent="submitBook()">
+							<h2>Créer un rendez-vous</h2>
+							<p><b x-text="panel.ev.title"></b> est disponible de <b x-text="cal.time(panel.ev.start)"></b> à <b x-text="cal.time(panel.ev.end)"></b>
+								(préférence <span x-text="Math.round((panel.ev.love ?? 0) * 100) + ' %'"></span>).</p>
+							<label>Début <input type="datetime-local" x-model="panel.form.start" step="900" @change="checkRooms()" required></label>
+							<label>Durée (minutes) <input type="number" min="15" step="15" x-model="panel.form.duration" @change="checkRooms()" required></label>
+							<label>Salle
+								<select x-model="panel.form.roomName">
+									<option value="">Sans salle</option>
+									<template x-for="r in panel.rooms" :key="r.name">
+										<option :value="r.name" :disabled="r.available === false || r.free === 0" x-text="r.name + ((r.available === false || r.free === 0) ? ' (complète)' : '')"></option>
+									</template>
+								</select>
+							</label>
+							<label>Commentaire <textarea x-model="panel.form.comment" maxlength="2000" rows="3"></textarea></label>
+							<p data-actions><button type="submit" :disabled="busy">Créer le rendez-vous</button></p>
+						</form>
+					</template>
+
+					<template x-if="panel.type === 'meeting'">
+						<div>
+							<h2>Rendez-vous</h2>
+							<dl>
+								<dt>Date</dt><dd x-text="fmt(panel.m.startAt) + ' · ' + panel.m.durationMinutes + ' min'"></dd>
+								<dt>Statut</dt><dd x-text="statusLabel(panel.m.status)"></dd>
+								<template x-if="role === 'agent'"><dt>Consommateur</dt></template>
+								<template x-if="role === 'agent'"><dd x-text="who(panel.m.assignationId)"></dd></template>
+								<dt>Salle</dt><dd x-text="roomOf(panel.m)"></dd>
+								<dt>Commentaire</dt><dd x-text="panel.m.comment || 'Aucun commentaire'"></dd>
+							</dl>
+							<template x-if="canEditMeeting(panel.m)">
+								<form @submit.prevent="saveMeeting()">
+									<label>Salle
+										<select x-model="panel.form.roomName">
+											<option value="">Sans salle</option>
+											<template x-for="r in rooms" :key="r.name"><option :value="r.name" x-text="r.name"></option></template>
+										</select>
+									</label>
+									<label>Commentaire <textarea x-model="panel.form.comment" maxlength="2000" rows="3"></textarea></label>
+									<p data-actions>
+										<button type="submit" :disabled="busy">Enregistrer</button>
+										<button type="button" @click="markDone()" :disabled="busy">Marquer comme terminé</button>
+									</p>
+								</form>
+							</template>
+							<template x-if="canCancelMeeting(panel.m)">
+								<p data-actions><button type="button" data-variant="danger" @click="cancelMeeting()" :disabled="busy">Annuler le rendez-vous</button></p>
+							</template>
+						</div>
+					</template>
+				</aside>
+			</template>
+		</section>
+	</template>
+</main>
+
+</body>
+</html>

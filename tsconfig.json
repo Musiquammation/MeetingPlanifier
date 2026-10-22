@@ -1,0 +1,26 @@
+{
+  "type": "module",
+  "scripts": {
+    "sync": "cp -r commons/protocols client/public",
+    "client": "vite",
+    "bundle": "vite build --mode bundle",
+    "build": "vite build",
+    "server": "tsx watch server/server.ts",
+    "test": "tsx draft/test.ts",
+    "check": "tsc --noEmit",
+    "video": "tsx video/video.ts"
+  },
+  "dependencies": {
+    "alpinejs": "^3.16.2",
+    "marked": "^18.0.13",
+    "phaser": "^4.2.1",
+    "protobufjs": "^8.7.2",
+    "sqlite3": "^6.0.1",
+    "tsx": "^4.23.12",
+    "vite": "^8.2.2"
+  },
+  "devDependencies": {
+    "@types/alpinejs": "^3.13.11",
+    "@types/node": "^26.5.0"
+  }
+}
