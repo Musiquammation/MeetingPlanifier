@@ -5,13 +5,14 @@
 import Alpine from "alpinejs";
 import { Calendar, addDays, toLocalInput, type CalEvent, type EventKind } from "./Calendar";
 import { fetcher } from "./fetcher";
-import type { AvailabilityRequest, Company, Meeting, Page, Role, Room } from "./types";
+import type { AvailabilityRequest, Company, Meeting, Package, Page, Role, Room } from "./types";
 
 /** Required role per page (null = public page). */
 const PAGES: Record<Page, Role | null> = {
 	main: null,
 	"admin-welcome": null, "admin-login": null, "admin-signup": null,
 	"admin-dashboard": "admin", "admin-companies": "admin", "admin-consumers": "admin", "admin-agents": "admin", "admin-rooms": "admin",
+	"admin-packages": "admin", "admin-results": "admin",
 	"agent-welcome": null, "agent-login": null, "agent-signup": null,
 	"agent-dashboard": "agent", "agent-companies": "agent", "agent-consumers": "agent", "agent-agenda": "agent",
 	"consumer-welcome": null, "consumer-access": null,
@@ -65,6 +66,17 @@ export class DomHandler {
 	agentResults: any[] = [];
 	searched = false; // an agent search has been run
 	openAgent: number | null = null; // agent whose assignations are displayed
+	packages: Package[] = []; // hourly-rate formulas of the company
+	// Room page: drag and drop ordering, day calendar of the rooms and the manual assignment dialog
+	dragRoom: number | null = null;
+	overRoom: number | null = null;
+	roomCal = new Calendar(); // one day, one column per room (never persisted: see applyRoomHours)
+	roomMeetings: Meeting[] = [];
+	assignDialog: { agent: any; q: string; fidelityId: string; error: string } = { agent: null, q: "", fidelityId: "", error: "" };
+	// Results page: agents and consumers the admin chose to hide
+	resultMeetings: Meeting[] = [];
+	hiddenAgents: Record<number, boolean> = {};
+	hiddenConsumers: Record<number, boolean> = {};
 
 	cal = new Calendar();
 
@@ -124,6 +136,8 @@ export class DomHandler {
 		this.meetings = []; this.consumers = []; this.agents = []; this.rooms = []; this.dispos = [];
 		this.suggestions = []; this.slots = []; this.requests = []; this.agentsList = []; this.selAssign = null; this.assignations = []; this.showDispo = {};
 		this.cal.events = [];
+		this.packages = []; this.roomMeetings = []; this.resultMeetings = []; this.roomCal.events = [];
+		this.hiddenAgents = {}; this.hiddenConsumers = {};
 	}
 
 	async logout(): Promise<void> {
@@ -178,18 +192,34 @@ export class DomHandler {
 		switch (this.page) {
 			case "admin-dashboard":
 				return this.load(async () => {
-					const [a, c, ag] = await Promise.all([fetcher.agenda(from, to), fetcher.consumers(), fetcher.agents()]);
-					this.meetings = a.meetings ?? []; this.consumers = c; this.agents = ag;
+					// The assignations give the agent and the consumer of each meeting; the rooms feed the room selector.
+					const [a, c, ag, asg, rooms] = await Promise.all([fetcher.agenda(from, to), fetcher.consumers(), fetcher.agents(), fetcher.assignations(), fetcher.rooms()]);
+					this.meetings = a.meetings ?? []; this.consumers = c; this.agents = ag; this.assignations = asg; this.rooms = rooms;
 				});
 			case "admin-companies": case "agent-companies":
 				return this.load(async () => { this.companies = await fetcher.companies(); });
 			case "admin-consumers":
-				return this.load(async () => { [this.consumers, this.agents] = await Promise.all([fetcher.consumers(), fetcher.agents()]); });
+				return this.load(async () => { [this.consumers, this.agents, this.packages] = await Promise.all([fetcher.consumers(), fetcher.agents(), fetcher.packages()]); });
 			case "admin-agents":
 				this.agentResults = []; this.searched = false; this.openAgent = null;
-				return this.load(async () => { [this.consumers, this.agents, this.assignations] = await Promise.all([fetcher.consumers(), fetcher.agents(), fetcher.assignations()]); });
+				return this.load(async () => { [this.consumers, this.agents, this.assignations, this.packages] = await Promise.all([fetcher.consumers(), fetcher.agents(), fetcher.assignations(), fetcher.packages()]); });
 			case "admin-rooms":
-				return this.load(() => this.loadRooms());
+				// The room calendar shows one day; its settings are local to the page and never saved.
+				this.roomCal.settings = { ...this.roomCal.settings, mode: "days", daysCount: 1 };
+				this.roomCal.onRange = () => void this.load(() => this.loadRoomCalendar());
+				return this.load(async () => {
+					this.assignations = await fetcher.assignations();
+					await this.loadRooms();
+					await this.loadRoomCalendar();
+				});
+			case "admin-packages":
+				return this.load(async () => { this.packages = await fetcher.packages(); });
+			case "admin-results":
+				return this.load(async () => {
+					// Every meeting of the company, whatever its date.
+					const [a, c, ag, asg] = await Promise.all([fetcher.agenda("2000-01-01T00:00:00.000Z", "2100-01-01T00:00:00.000Z"), fetcher.consumers(), fetcher.agents(), fetcher.assignations()]);
+					this.resultMeetings = a.meetings ?? []; this.consumers = c; this.agents = ag; this.assignations = asg;
+				});
 			case "agent-consumers":
 				return this.load(async () => { this.assignations = await fetcher.myConsumers(); });
 			case "agent-dashboard":
@@ -261,6 +291,52 @@ export class DomHandler {
 	currentRequest(): AvailabilityRequest | undefined {
 		const mine = this.requests.filter((r) => r.assignationId === this.selAssign);
 		return mine.find((r) => (r.scheduledHours ?? 0) < r.requestedHours) ?? mine[0];
+	}
+
+	// ---- Admin helpers: who, rooms and prices -------------------------------
+	/** Assignation (agent + consumer) of a meeting, from the admin's assignation list. */
+	assignationOf(m: Meeting): any { return this.assignations.find((x) => x.id === m.assignationId); }
+	meetingAgent(m: Meeting): string { const a = this.assignationOf(m); return a ? this.agentLabel(a) : "—"; }
+	meetingConsumer(m: Meeting): string { const a = this.assignationOf(m); return a ? this.consumerLabel(a) : "—"; }
+	money(n: number): string { return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(n || 0); }
+	packageLabel(p: Package): string { return `${p.name} (${this.money(p.hourlyRate)}/h)`; }
+	packageById(id: number | null | undefined): Package | undefined { return id == null ? undefined : this.packages.find((p) => p.id === id); }
+
+	/** Highest number of simultaneous intervals inside [from, to). */
+	private peak(intervals: Array<{ s: number; e: number }>, from: number, to: number): number {
+		const ev: Array<[number, number]> = [];
+		for (const i of intervals) {
+			const s = Math.max(from, i.s), e = Math.min(to, i.e);
+			if (e > s) ev.push([s, 1], [e, -1]);
+		}
+		ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+		let cur = 0, max = 0;
+		for (const [, d] of ev) { cur += d; max = Math.max(max, cur); }
+		return max;
+	}
+
+	/** True when the room cannot host this meeting (the server stays the final judge). */
+	roomFull(r: Room, m: Meeting): boolean {
+		if (r.limit === -1 || m.roomName === r.name) return false;
+		const s = Date.parse(m.startAt), e = s + m.durationMinutes * 60000;
+		const others = this.meetings
+			.filter((x) => x.id !== m.id && x.status !== "canceledBy" && x.roomName === r.name)
+			.map((x) => ({ s: Date.parse(x.startAt), e: Date.parse(x.startAt) + x.durationMinutes * 60000 }));
+		return this.peak(others, s, e) >= r.limit;
+	}
+
+	/** Admin dashboard: give (or remove) the room of an upcoming meeting. */
+	async setMeetingRoom(m: Meeting, select: HTMLSelectElement) {
+		await this.run(async () => {
+			try {
+				await fetcher.patchMeeting(m.id, { roomName: select.value || null });
+			} catch (e) {
+				select.value = m.roomName ?? ""; // show the real room again
+				throw e;
+			}
+			const { from, to } = horizon(14);
+			this.meetings = (await fetcher.agenda(from, to)).meetings ?? [];
+		}, "Salle mise à jour.");
 	}
 
 	// ---- Public pages: authentication ------------------------------------
@@ -358,12 +434,80 @@ export class DomHandler {
 		}, "Assignation supprimée.");
 	}
 
-	async assign() {
+	/** Opens the dialog used to attribute one more consumer to an agent. */
+	openAssign(a: any) {
+		this.assignDialog = { agent: a, q: "", fidelityId: "", error: "" };
+		(document.getElementById("assign-dialog") as HTMLDialogElement | null)?.showModal();
+	}
+
+	closeAssign() {
+		(document.getElementById("assign-dialog") as HTMLDialogElement | null)?.close();
+		this.assignDialog.agent = null;
+	}
+
+	/** Consumers of the company that are not yet assigned to the chosen agent, filtered by the search text. */
+	assignableConsumers(): any[] {
+		const agent = this.assignDialog.agent;
+		if (!agent) return [];
+		const taken = new Set(this.assignationsOf(agent).map((x) => x.fidelityId));
+		const q = this.assignDialog.q.trim().toLowerCase();
+		return this.consumers.filter((c) => !taken.has(this.fidelityId(c))
+			&& (!q || `${this.consumerLabel(c)} ${this.consumerOf(c).username}`.toLowerCase().includes(q)));
+	}
+
+	async confirmAssign() {
+		const d = this.assignDialog;
+		if (!d.agent || !d.fidelityId) return;
 		await this.run(async () => {
-			await fetcher.assign(Number(this.form.agentId), Number(this.form.fidelityId));
+			try {
+				await fetcher.assign(d.agent.id, Number(d.fidelityId));
+				this.assignations = await fetcher.assignations();
+			} catch (e: any) {
+				d.error = e?.message ?? "Assignation impossible."; // shown inside the dialog, the page is hidden behind it
+				return;
+			}
+			this.closeAssign();
+		}, "Consommateur attribué à l’agent.");
+	}
+
+	// ---- Packages and prices -----------------------------------------------
+	async createPackage() {
+		await this.run(async () => {
+			const rate = Number(String(this.form.hourlyRate ?? "").replace(",", "."));
+			if (!Number.isFinite(rate) || rate < 0) throw new Error("Le prix horaire doit être un nombre supérieur ou égal à 0.");
+			await fetcher.createPackage(String(this.form.name ?? ""), rate);
 			this.form = {};
+			this.packages = await fetcher.packages();
+		}, "Formule créée.");
+	}
+
+	async deletePackage(p: Package) {
+		if (!confirm(`Supprimer la formule « ${p.name} » ?`)) return;
+		await this.run(async () => { await fetcher.deletePackage(p.id); this.packages = await fetcher.packages(); }, "Formule supprimée.");
+	}
+
+	/** Default package id of a consumer row ({ consumer, fidelity }), or null when not defined. */
+	defaultPackageId(c: any): number | null { return c.fidelity?.defaultPackageId ?? null; }
+
+	async setConsumerPackage(c: any, value: string) {
+		await this.run(async () => {
+			await fetcher.setConsumerPackage(this.fidelityId(c), value ? Number(value) : null);
+			this.consumers = await fetcher.consumers();
+		}, "Formule par défaut enregistrée.");
+	}
+
+	/** Text of the "default" option of an assignation: it shows the package the default would give. */
+	defaultOptionLabel(x: any): string {
+		const c = this.consumers.find((k) => this.fidelityId(k) === x.fidelityId);
+		const p = c ? this.packageById(this.defaultPackageId(c)) : undefined;
+		return p ? `Par défaut (${this.packageLabel(p)})` : `Par défaut (aucune formule : ${this.money(0)})`;
+	}
+
+	async setAssignationPackage(x: any, value: string) {
+		await this.run(async () => {
+			await fetcher.setAssignationPackage(x.id, value ? Number(value) : null);
 			this.assignations = await fetcher.assignations();
-		}, "Agent assigné au consommateur.");
+		}, "Prix horaire enregistré.");
 	}
 
 	private async loadRooms(): Promise<void> {
@@ -380,16 +524,123 @@ export class DomHandler {
 		}, "Salle créée.");
 	}
 
-	async saveRoom(r: Room) {
+	/** Single "Enregistrer" button: names, limits and the order of every room are saved together, atomically. */
+	async saveRooms() {
 		await this.run(async () => {
-			const limit = Number(r.draftLimit);
-			if (!Number.isInteger(limit) || (limit !== -1 && limit < 1)) throw new Error("La limite vaut -1 (illimitée) ou un entier positif.");
-			let name = r.name;
-			if (r.draftName && r.draftName !== name) { await fetcher.renameRoom(name, r.draftName); name = r.draftName; }
-			if (limit !== r.limit) await fetcher.updateRoomLimit(name, limit);
+			const items = this.rooms.map((r) => {
+				const limit = Number(r.draftLimit);
+				if (!Number.isInteger(limit) || (limit !== -1 && limit < 1)) throw new Error(`La limite de « ${r.name} » vaut -1 (illimitée) ou un entier positif.`);
+				const newName = (r.draftName ?? "").trim();
+				return { name: r.name, newName: newName && newName !== r.name ? newName : undefined, limit };
+			});
+			await fetcher.saveRooms(items);
 			await this.loadRooms();
-		}, "Salle enregistrée.");
+			await this.loadRoomCalendar();
+		}, "Salles enregistrées.");
 	}
+
+	// Order of the rooms: drag the handle, or use the arrows (touch screens). Nothing is saved until "Enregistrer".
+	moveRoom(from: number, to: number) {
+		if (from === to || from < 0 || to < 0 || from >= this.rooms.length || to >= this.rooms.length) return;
+		const list = [...this.rooms];
+		const [item] = list.splice(from, 1);
+		list.splice(to, 0, item);
+		this.rooms = list;
+	}
+	roomDragStart(e: DragEvent, index: number) {
+		this.dragRoom = index;
+		if (e.dataTransfer) {
+			e.dataTransfer.effectAllowed = "move";
+			e.dataTransfer.setData("text/plain", String(index)); // Firefox needs some data to start a drag
+			const row = (e.target as HTMLElement).closest("tr");
+			if (row) e.dataTransfer.setDragImage(row, 0, 0);
+		}
+	}
+	roomDragOver(e: DragEvent, index: number) {
+		if (this.dragRoom === null) return;
+		e.preventDefault();
+		this.overRoom = index;
+	}
+	roomDrop(e: DragEvent, index: number) {
+		e.preventDefault();
+		if (this.dragRoom !== null) this.moveRoom(this.dragRoom, index);
+		this.roomDragEnd();
+	}
+	roomDragEnd() { this.dragRoom = null; this.overRoom = null; }
+
+	// ---- Room calendar (one day, one column per room) ------------------------
+	async loadRoomCalendar(): Promise<void> {
+		const { from, to } = this.roomCal.range;
+		const a = await fetcher.agenda(from, to);
+		this.roomMeetings = (a.meetings ?? []).filter((m: Meeting) => m.status !== "canceledBy");
+		this.roomCal.events = this.roomMeetings.map((m) => ({
+			id: `room-${m.id}`, kind: "meeting" as EventKind, title: `${this.meetingAgent(m)} · ${this.meetingConsumer(m)}`, status: m.status, raw: m,
+			start: new Date(m.startAt), end: new Date(Date.parse(m.startAt) + m.durationMinutes * 60000)
+		}));
+	}
+
+	/** Columns of the room calendar: the active rooms in their order, then the meetings that have no room. */
+	roomColumns(): Array<{ key: string; label: string; name: string | null }> {
+		return [
+			...this.rooms.map((r) => ({ key: r.name, label: r.name, name: r.name as string | null })),
+			{ key: "(none)", label: "Sans salle", name: null }
+		];
+	}
+	roomColumnEvents(name: string | null) {
+		const events = this.roomCal.events.filter((e) => (e.raw.roomName ?? null) === name);
+		return this.roomCal.layout(events, this.roomCal.first);
+	}
+	/** Visible hours of the room calendar (kept in memory only, so the agent agenda settings are not touched). */
+	applyRoomHours() {
+		const s = this.roomCal.settings;
+		s.startHour = Math.min(22, Math.max(0, Math.round(Number(s.startHour)) || 0));
+		s.endHour = Math.min(24, Math.max(s.startHour + 1, Math.round(Number(s.endHour)) || 24));
+	}
+
+	/** Automatic room assignment over the period typed in the form. */
+	async autoAssignRooms() {
+		await this.run(async () => {
+			const from = new Date(String(this.form.autoFrom ?? ""));
+			const to = new Date(String(this.form.autoTo ?? ""));
+			if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) throw new Error("Indiquez le début et la fin de la période.");
+			if (to.getTime() <= from.getTime()) throw new Error("La fin de la période doit être après son début.");
+			const r = await fetcher.autoAssignRooms(from.toISOString(), to.toISOString());
+			this.roomCal.anchor = from; // show the day that was just processed
+			await this.loadRoomCalendar();
+			const n = r.assigned.length, k = r.unassigned.length;
+			this.notice = n + (n > 1 ? " rendez-vous ont reçu une salle." : " rendez-vous a reçu une salle.")
+				+ (k ? ` ${k} n’${k > 1 ? "ont" : "a"} pas pu en recevoir (aucune salle assez grande de libre).` : "");
+		});
+	}
+
+	// ---- Results: one table per month ------------------------------------------
+	isAgentHidden(id: number): boolean { return this.hiddenAgents[id] === true; }
+	isConsumerHidden(id: number): boolean { return this.hiddenConsumers[id] === true; }
+	toggleAgentFilter(id: number) { this.hiddenAgents = { ...this.hiddenAgents, [id]: !this.isAgentHidden(id) }; }
+	toggleConsumerFilter(id: number) { this.hiddenConsumers = { ...this.hiddenConsumers, [id]: !this.isConsumerHidden(id) }; }
+	setAllAgents(on: boolean) { this.hiddenAgents = Object.fromEntries(this.agents.map((a) => [a.id, !on])); }
+	setAllResultConsumers(on: boolean) { this.hiddenConsumers = Object.fromEntries(this.consumers.map((c) => [this.consumerOf(c).id, !on])); }
+
+	/** Meetings grouped by month (newest month first), after the agent/consumer filters. Cancelled meetings are not billed. */
+	resultMonths(): Array<{ key: string; label: string; rows: any[]; total: number }> {
+		const months = new Map<string, { key: string; label: string; rows: any[]; total: number }>();
+		for (const m of this.resultMeetings) {
+			if (m.status === "canceledBy") continue;
+			const a = this.assignationOf(m);
+			if (!a || this.isAgentHidden(a.agent.id) || this.isConsumerHidden(a.consumer.id)) continue;
+			const d = new Date(m.startAt);
+			const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+			if (!months.has(key)) months.set(key, { key, label: d.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }), rows: [], total: 0 });
+			const month = months.get(key)!;
+			const rate = m.hourlyRate ?? 0;
+			const price = rate * m.durationMinutes / 60; // hourly rate x duration in hours
+			month.rows.push({ id: m.id, agent: this.agentLabel(a), consumer: this.consumerLabel(a), start: m.startAt, rate, minutes: m.durationMinutes, hours: m.durationMinutes / 60, price });
+			month.total += price;
+		}
+		for (const month of months.values()) month.rows.sort((x, y) => Date.parse(x.start) - Date.parse(y.start));
+		return [...months.values()].sort((x, y) => (x.key < y.key ? 1 : -1));
+	}
+	hoursLabel(h: number): string { return `${Math.round(h * 100) / 100} h`; }
 
 	async deactivateRoom(r: Room) {
 		if (!confirm(`Désactiver la salle « ${r.name} » ?`)) return;
@@ -450,7 +701,7 @@ export class DomHandler {
 		e.preventDefault();
 		const payload = e.dataTransfer?.getData("text/calendar-event");
 		if (!payload) return;
-		let data: { kind: EventKind; id: number; duration: number };
+		let data: { kind: EventKind; id: number; duration: number; love?: number };
 		try { data = JSON.parse(payload); } catch { return; }
 		if (data.kind !== "dispo" && data.kind !== "suggestion") return;
 		const col = e.currentTarget as HTMLElement;
@@ -459,7 +710,7 @@ export class DomHandler {
 		const start = new Date(day); start.setHours(0, minutes, 0, 0);
 		if (start.getTime() <= Date.now()) { this.error = "Impossible de déplacer un créneau dans le passé."; return; }
 		await this.run(async () => {
-			const body = { startAt: start.toISOString(), durationMinutes: data.duration };
+			const body = { startAt: start.toISOString(), durationMinutes: data.duration, love: data.love ?? 0.5 };
 			if (data.kind === "dispo") await fetcher.updateDispo(data.id, body);
 			else await fetcher.updateSuggestion(data.id, body);
 			await this.refreshAgenda();
@@ -469,7 +720,7 @@ export class DomHandler {
 	dragCalendarEvent(e: DragEvent, ev: CalEvent) {
 		if (!ev.editable || (ev.kind !== "dispo" && ev.kind !== "suggestion")) { e.preventDefault(); return; }
 		e.dataTransfer?.setData("text/calendar-event", JSON.stringify({
-			kind: ev.kind, id: ev.raw.id, duration: Math.round((ev.end.getTime() - ev.start.getTime()) / 60000)
+			kind: ev.kind, id: ev.raw.id, duration: Math.round((ev.end.getTime() - ev.start.getTime()) / 60000), love: ev.raw.love
 		}));
 		if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
 	}

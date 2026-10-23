@@ -26,6 +26,11 @@ function positiveInt(value: unknown, label: string): number {
   if (!Number.isInteger(n) || n <= 0) throw new Error(`${label} doit être un entier positif.`);
   return n;
 }
+/** Optional positive integer: undefined, null and "" all mean "no value" (returned as null). */
+function optionalId(value: unknown, label: string): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  return positiveInt(value, label);
+}
 function intervalInput(body: any) {
   const startAt = requiredString(body.startAt ?? body.start_at, "startAt", 40);
   const durationMinutes = positiveInt(body.durationMinutes ?? body.duration_minutes, "durationMinutes");
@@ -257,6 +262,45 @@ export function initApi(app: Express, database: Db): void {
 	} catch (e: any) { return fail(res, 400, /FOREIGN KEY|constraint/i.test(e.message) ? "Impossible : cette assignation a des rendez-vous." : e.message || "Suppression impossible."); }
   });
 
+  /** Chooses the package (hourly rate) of an agent/consumer pair; packageId null = use the consumer's default package. */
+  app.patch("/api/assignations/:id", admin, (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (!database.listAssignationsForCompany(companyId(req)).some((a: any) => a.id === id)) return fail(res, 404, "Assignation introuvable.");
+	  return res.json(database.setAssignationPackage(id, optionalId(req.body.packageId, "packageId")));
+	} catch (e: any) { return fail(res, 400, e.message || "Modification impossible."); }
+  });
+
+  /** Sets the default package (formule par défaut) of a consumer in the admin's company; null = not defined (price 0). */
+  app.patch("/api/fidelities/:id", admin, (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (database.getFidelityById(id)?.companyId !== companyId(req)) return fail(res, 404, "Consommateur introuvable dans votre société.");
+	  return res.json(database.setFidelityDefaultPackage(id, optionalId(req.body.defaultPackageId, "defaultPackageId")));
+	} catch (e: any) { return fail(res, 400, e.message || "Modification impossible."); }
+  });
+
+  app.get("/api/packages", admin, (req, res) => {
+	try { return res.json(database.listPackages(companyId(req))); }
+	catch (e: any) { return fail(res, 400, e.message); }
+  });
+  app.post("/api/packages", admin, (req, res) => {
+	try {
+	  const name = requiredString(req.body.name, "name", 120);
+	  const hourlyRate = Number(req.body.hourlyRate);
+	  if (!Number.isFinite(hourlyRate) || hourlyRate < 0) return fail(res, 400, "Le prix horaire doit être un nombre supérieur ou égal à 0.");
+	  return res.status(201).json(database.createPackage(companyId(req), name, hourlyRate));
+	} catch (e: any) { return fail(res, 400, /UNIQUE/i.test(e.message) ? "Une formule porte déjà ce nom." : e.message || "Création impossible."); }
+  });
+  app.delete("/api/packages/:id", admin, (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (database.getPackageById(id)?.companyId !== companyId(req)) return fail(res, 404, "Formule introuvable.");
+	  database.deletePackage(id);
+	  return res.json({ ok: true });
+	} catch (e: any) { return fail(res, 400, /FOREIGN KEY|constraint/i.test(e.message) ? "Impossible : cette formule est encore utilisée." : e.message || "Suppression impossible."); }
+  });
+
   app.get("/api/my-consumers", auth(["agent"]), (req, res) => {
 	try { return res.json(database.listAssignationDetailsForAgent(session(req).id)); }
 	catch (e: any) { return fail(res, 400, e.message); }
@@ -279,6 +323,31 @@ export function initApi(app: Express, database: Db): void {
 	  if (!Number.isInteger(limit) || (limit !== -1 && limit < 1)) return fail(res, 400, "limit doit valoir -1 ou un entier positif.");
 	  return res.status(201).json(database.createRoom(companyId(req), name, limit));
 	} catch (e: any) { return fail(res, 400, e.message); }
+  });
+  /** Saves every room at once, in one transaction: rooms[] is in display order, each with its current name, optional newName and limit. */
+  app.put("/api/rooms", admin, (req, res) => {
+	try {
+	  if (!Array.isArray(req.body.rooms)) return fail(res, 400, "La liste des salles est requise.");
+	  const items = req.body.rooms.map((r: any) => {
+		const limit = Number(r?.limit);
+		if (!Number.isInteger(limit) || (limit !== -1 && limit < 1)) throw new Error("limit doit valoir -1 ou un entier positif.");
+		return {
+		  name: requiredString(r?.name, "name", 100),
+		  newName: r?.newName === undefined || r.newName === null ? undefined : requiredString(r.newName, "newName", 100),
+		  limit
+		};
+	  });
+	  return res.json(database.saveRooms(companyId(req), items));
+	} catch (e: any) { return fail(res, 400, /UNIQUE|PRIMARY KEY/i.test(e.message) ? "Deux salles ne peuvent pas porter le même nom." : e.message); }
+  });
+  /** Gives a room to the pending meetings without one on a period (see Database.autoAssignRooms for the rules). */
+  app.post("/api/rooms/auto-assign", admin, (req, res) => {
+	try {
+	  const from = requiredString(req.body.from, "from", 40);
+	  const to = requiredString(req.body.to, "to", 40);
+	  if (!Number.isFinite(Date.parse(from)) || !Number.isFinite(Date.parse(to)) || Date.parse(from) >= Date.parse(to)) return fail(res, 400, "Plage de dates invalide.");
+	  return res.json(database.autoAssignRooms(companyId(req), from, to));
+	} catch (e: any) { return fail(res, 400, e.message || "Attribution impossible."); }
   });
   app.patch("/api/rooms/:name", admin, (req, res) => {
 	try {

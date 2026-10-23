@@ -7,7 +7,7 @@ export type Id = number;
 export type Page =
 	| "main"
 	| "admin-welcome" | "admin-login" | "admin-signup"
-	| "admin-dashboard" | "admin-companies" | "admin-consumers" | "admin-agents" | "admin-rooms"
+	| "admin-dashboard" | "admin-companies" | "admin-consumers" | "admin-agents" | "admin-rooms" | "admin-packages" | "admin-results"
 	| "agent-welcome" | "agent-login" | "agent-signup"
 	| "agent-dashboard" | "agent-companies" | "agent-consumers" | "agent-agenda"
 	| "consumer-welcome" | "consumer-access" | "consumer-dashboard" | "consumer-agenda";
@@ -18,6 +18,8 @@ export interface Room {
 	name: string;
 	limit: number;
 	active?: boolean;
+	/** Order chosen by the admin (drag and drop in #admin-rooms). */
+	position?: number;
 	// Filled by GET /api/rooms/availability
 	available?: boolean;
 	free?: number;
@@ -34,8 +36,13 @@ export interface Meeting {
 	status: "pending" | "done" | "canceledBy";
 	room?: string | null;
 	roomName?: string | null;
+	/** Hourly rate applied to the meeting (from the package resolved when the meeting was created). */
+	hourlyRate?: number;
 	comment?: string;
 }
+
+/** A package ("formule") is a named hourly rate. */
+export interface Package { id: Id; name: string; hourlyRate: number }
 
 export interface AvailabilityRequest {
 	id: Id;

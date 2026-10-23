@@ -135,10 +135,13 @@ export class Calendar {
 
 	// ---- Layout ----------------------------------------------------------
 	/** Events of one day with lane assignment so overlapping events sit side by side. */
-	layoutFor(day: Date): Placed[] {
+	layoutFor(day: Date): Placed[] { return this.layout(this.events, day); }
+
+	/** Same layout for an arbitrary list of events (the room calendar draws one column per room). */
+	layout(events: CalEvent[], day: Date): Placed[] {
 		const lo = new Date(day).setHours(this.settings.startHour, 0, 0, 0);
 		const hi = new Date(day).setHours(this.settings.endHour, 0, 0, 0);
-		const items: Placed[] = this.events
+		const items: Placed[] = events
 			.filter((e) => e.end.getTime() > lo && e.start.getTime() < hi)
 			.map((ev) => {
 				const s = Math.max(ev.start.getTime(), lo);

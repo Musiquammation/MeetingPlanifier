@@ -299,3 +299,31 @@ input, select, textarea { max-width: 100%; }
 }
 [data-cal] [data-event]:active { cursor: crosshair; }
 [data-cal] [data-select] { z-index: 5; }
+
+/* ---- Admin: dashboard room selector, rooms, packages, results --------------------- */
+td select { min-width: 10rem; }
+tfoot th { color: var(--ink); font-size: 1rem; }
+[data-month] { text-transform: capitalize; }
+
+/* Dialog used to attribute one more consumer to an agent */
+dialog {
+	width: min(32rem, calc(100vw - 2rem)); padding: 1.25rem;
+	color: var(--ink); background: var(--surface);
+	border: 1px solid var(--line); border-radius: 0.75rem; box-shadow: 0 0.5rem 2rem rgb(0 0 0 / 0.3);
+}
+dialog::backdrop { background: rgb(0 0 0 / 0.45); }
+dialog h2 { margin-top: 0; }
+dialog select[size] { width: 100%; }
+
+/* Room list: drag handle, drop target and the "Enregistrer" bar kept visible at the bottom */
+[data-handle] { display: inline-block; padding: 0 0.5rem; font-size: 1.4rem; line-height: 1; color: var(--muted); cursor: grab; user-select: none; -webkit-user-select: none; }
+[data-handle]:active { cursor: grabbing; }
+tr[data-dragging] { opacity: 0.4; }
+tr[data-drop] td { box-shadow: inset 0 3px 0 var(--pine); }
+[data-savebar] { position: sticky; bottom: 0; z-index: 6; margin: 0.75rem 0 0; padding: 0.75rem 0; background: var(--paper); border-top: 1px solid var(--line); }
+
+/* Room calendar: read-only, one column per room (scrolls sideways when there are many rooms) */
+[data-roomcal] [data-head], [data-roomcal] [data-grid] { min-width: calc(var(--gutter) + var(--days) * 7rem); }
+[data-roomcal] [data-day] { cursor: default; }
+[data-roomcal] [data-event] { cursor: default; touch-action: auto; }
+[data-roomcal] [data-event]:active { cursor: default; }

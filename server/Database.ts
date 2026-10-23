@@ -65,6 +65,17 @@ export interface Fidelity {
   companyId: number;
   consumerId: number;
   active: boolean;
+  /** Default package (hourly-rate formula) of the consumer in this company; null = not defined, price is 0. */
+  defaultPackageId: number | null;
+  createdAt: string;
+}
+
+/** A package is a named hourly rate that an admin can attach to consumers and assignations. */
+export interface Package {
+  id: number;
+  companyId: number;
+  name: string;
+  hourlyRate: number;
   createdAt: string;
 }
 
@@ -79,6 +90,8 @@ export interface Assignation {
   id: number;
   agentId: number;
   fidelityId: number;
+  /** Package chosen for this agent/consumer pair; null = use the consumer's default package. */
+  packageId: number | null;
   createdAt: string;
 }
 
@@ -87,8 +100,17 @@ export interface Room {
   name: string;
   limit: number;
   active: boolean;
+  /** Display order chosen by the admin (also the preference order of the automatic room assignment). */
+  position: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Result of the automatic room assignment over a period. */
+export interface AutoAssignRoomsResult {
+  assigned: Array<{ meetingId: number; roomName: string }>;
+  /** Meetings for which no allowed room had enough capacity. */
+  unassigned: number[];
 }
 
 export interface AvailabilityRequest {
@@ -138,6 +160,8 @@ export interface Meeting {
   status: MeetingStatus;
   roomCompanyId: number | null;
   roomName: string | null;
+  /** Hourly rate applied to this meeting (snapshot of the package resolved at creation). */
+  hourlyRate: number;
   comment: string;
   canceledByRole: Role | null;
   canceledById: number | null;
@@ -281,16 +305,29 @@ CREATE TABLE IF NOT EXISTS consumers (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS packages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  name TEXT NOT NULL COLLATE NOCASE CHECK (length(trim(name)) BETWEEN 1 AND 120),
+  hourly_rate REAL NOT NULL DEFAULT 0 CHECK (hourly_rate >= 0),
+  created_at TEXT NOT NULL,
+  UNIQUE (company_id, name),
+  FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_packages_company ON packages(company_id);
+
 CREATE TABLE IF NOT EXISTS fidelities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key TEXT NOT NULL UNIQUE CHECK (length(key) = 6),
   company_id INTEGER NOT NULL,
   consumer_id INTEGER NOT NULL,
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  default_package_id INTEGER,
   created_at TEXT NOT NULL,
   UNIQUE (company_id, consumer_id),
   FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE RESTRICT,
-  FOREIGN KEY (consumer_id) REFERENCES consumers(id) ON DELETE RESTRICT
+  FOREIGN KEY (consumer_id) REFERENCES consumers(id) ON DELETE RESTRICT,
+  FOREIGN KEY (default_package_id) REFERENCES packages(id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_fidelities_consumer ON fidelities(consumer_id);
 CREATE INDEX IF NOT EXISTS idx_fidelities_company ON fidelities(company_id, active);
@@ -322,10 +359,12 @@ CREATE TABLE IF NOT EXISTS assignations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_id INTEGER NOT NULL,
   fidelity_id INTEGER NOT NULL,
+  package_id INTEGER,
   created_at TEXT NOT NULL,
   UNIQUE (agent_id, fidelity_id),
   FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE RESTRICT,
-  FOREIGN KEY (fidelity_id) REFERENCES fidelities(id) ON DELETE RESTRICT
+  FOREIGN KEY (fidelity_id) REFERENCES fidelities(id) ON DELETE RESTRICT,
+  FOREIGN KEY (package_id) REFERENCES packages(id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_assignations_agent ON assignations(agent_id);
 CREATE INDEX IF NOT EXISTS idx_assignations_fidelity ON assignations(fidelity_id);
@@ -335,6 +374,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   name TEXT NOT NULL COLLATE NOCASE CHECK (length(trim(name)) BETWEEN 1 AND 120),
   limit_count INTEGER NOT NULL CHECK (limit_count = -1 OR limit_count > 0),
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  position INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (company_id, name),
@@ -393,6 +433,7 @@ CREATE TABLE IF NOT EXISTS meetings (
   room_company_id INTEGER,
   room_name TEXT,
   comment TEXT NOT NULL DEFAULT '' CHECK (length(comment) <= 4000),
+  hourly_rate REAL NOT NULL DEFAULT 0 CHECK (hourly_rate >= 0),
   canceled_by_role TEXT CHECK (canceled_by_role IS NULL OR canceled_by_role IN ('admin', 'agent', 'consumer')),
   canceled_by_id INTEGER,
   idempotency_key TEXT UNIQUE,
@@ -502,7 +543,41 @@ END;
   initialize(): void {
   this.ensureOpen();
   this.connection.exec(Database.SCHEMA_SQL);
+  this.migrate();
   this.connection.exec("PRAGMA user_version = 1;");
+  }
+
+  /**
+   * Bring a database created by an older version of the schema up to date.
+   * CREATE TABLE IF NOT EXISTS never alters an existing table, so new columns are added here.
+   */
+  private migrate(): void {
+  const hasColumn = (table: string, column: string): boolean =>
+    (this.connection.prepare(`PRAGMA table_info(${table})`).all() as RawRow[]).some((row) => String(row.name) === column);
+  if (!hasColumn("fidelities", "default_package_id")) {
+    this.connection.exec("ALTER TABLE fidelities ADD COLUMN default_package_id INTEGER REFERENCES packages(id) ON DELETE RESTRICT");
+  }
+  if (!hasColumn("assignations", "package_id")) {
+    this.connection.exec("ALTER TABLE assignations ADD COLUMN package_id INTEGER REFERENCES packages(id) ON DELETE RESTRICT");
+  }
+  if (!hasColumn("meetings", "hourly_rate")) {
+    this.connection.exec("ALTER TABLE meetings ADD COLUMN hourly_rate REAL NOT NULL DEFAULT 0 CHECK (hourly_rate >= 0)");
+  }
+  if (!hasColumn("rooms", "position")) {
+    this.connection.exec("ALTER TABLE rooms ADD COLUMN position INTEGER NOT NULL DEFAULT 0");
+    // Keep the previous (alphabetical) order as the initial manual order of every company.
+    const rows = this.connection.prepare(
+    "SELECT company_id, name FROM rooms ORDER BY company_id, name COLLATE NOCASE",
+    ).all() as RawRow[];
+    const counters = new Map<number, number>();
+    const update = this.connection.prepare("UPDATE rooms SET position = ? WHERE company_id = ? AND name = ?");
+    for (const row of rows) {
+    const companyId = Number(row.company_id);
+    const index = counters.get(companyId) ?? 0;
+    counters.set(companyId, index + 1);
+    update.run(index, companyId, String(row.name));
+    }
+  }
   }
 
   /** Run a callback atomically and roll it back if any statement fails. */
@@ -855,7 +930,8 @@ END;
     `SELECT co.id AS consumer_id, co.name AS consumer_name, co.surname AS consumer_surname,
         co.username AS consumer_username, f.id AS fidelity_id, f.key AS fidelity_key,
         f.company_id AS fidelity_company_id, f.consumer_id AS fidelity_consumer_id,
-        f.active AS fidelity_active, f.created_at AS fidelity_created_at
+        f.active AS fidelity_active, f.default_package_id AS fidelity_default_package_id,
+        f.created_at AS fidelity_created_at
      FROM consumers co JOIN fidelities f ON f.consumer_id = co.id
      WHERE f.company_id = ? ORDER BY co.surname COLLATE NOCASE, co.name COLLATE NOCASE`,
   ).all(companyId) as RawRow[];
@@ -866,7 +942,8 @@ END;
     },
     fidelity: this.mapFidelity({
     id: row.fidelity_id, key: row.fidelity_key, company_id: row.fidelity_company_id,
-    consumer_id: row.fidelity_consumer_id, active: row.fidelity_active, created_at: row.fidelity_created_at,
+    consumer_id: row.fidelity_consumer_id, active: row.fidelity_active,
+    default_package_id: row.fidelity_default_package_id, created_at: row.fidelity_created_at,
     }),
   }));
   }
@@ -903,21 +980,21 @@ END;
 
   getFidelityById(id: number): Fidelity | null {
   const row = this.connection.prepare(
-    "SELECT id, key, company_id, consumer_id, active, created_at FROM fidelities WHERE id = ?",
+    "SELECT id, key, company_id, consumer_id, active, default_package_id, created_at FROM fidelities WHERE id = ?",
   ).get(id) as RawRow | undefined;
   return row ? this.mapFidelity(row) : null;
   }
 
   getFidelityByAccessKey(key: string): Fidelity | null {
   const row = this.connection.prepare(
-    "SELECT id, key, company_id, consumer_id, active, created_at FROM fidelities WHERE key = ? AND active = 1",
+    "SELECT id, key, company_id, consumer_id, active, default_package_id, created_at FROM fidelities WHERE key = ? AND active = 1",
   ).get(key) as RawRow | undefined;
   return row ? this.mapFidelity(row) : null;
   }
 
   listFidelitiesForCompany(companyId: number): Fidelity[] {
   const rows = this.connection.prepare(
-    "SELECT id, key, company_id, consumer_id, active, created_at FROM fidelities WHERE company_id = ? ORDER BY id",
+    "SELECT id, key, company_id, consumer_id, active, default_package_id, created_at FROM fidelities WHERE company_id = ? ORDER BY id",
   ).all(companyId) as RawRow[];
   return rows.map((row) => this.mapFidelity(row));
   }
@@ -938,21 +1015,21 @@ END;
 
   getAssignationById(id: number): Assignation | null {
   const row = this.connection.prepare(
-    "SELECT id, agent_id, fidelity_id, created_at FROM assignations WHERE id = ?",
+    "SELECT id, agent_id, fidelity_id, package_id, created_at FROM assignations WHERE id = ?",
   ).get(id) as RawRow | undefined;
   return row ? this.mapAssignation(row) : null;
   }
 
   listAssignationsForAgent(agentId: number): Assignation[] {
   const rows = this.connection.prepare(
-    "SELECT id, agent_id, fidelity_id, created_at FROM assignations WHERE agent_id = ? ORDER BY id",
+    "SELECT id, agent_id, fidelity_id, package_id, created_at FROM assignations WHERE agent_id = ? ORDER BY id",
   ).all(agentId) as RawRow[];
   return rows.map((row) => this.mapAssignation(row));
   }
 
   listAssignationsForConsumer(consumerId: number): Assignation[] {
   const rows = this.connection.prepare(
-    `SELECT a.id, a.agent_id, a.fidelity_id, a.created_at
+    `SELECT a.id, a.agent_id, a.fidelity_id, a.package_id, a.created_at
      FROM assignations a JOIN fidelities f ON f.id = a.fidelity_id
      WHERE f.consumer_id = ? AND f.active = 1 ORDER BY a.id`,
   ).all(consumerId) as RawRow[];
@@ -1021,12 +1098,13 @@ END;
   id: number;
   agentId: number;
   fidelityId: number;
+  packageId: number | null;
   createdAt: string;
   agent: Pick<Agent, "id" | "name" | "surname" | "username">;
   consumer: Pick<Consumer, "id" | "name" | "surname" | "username">;
   }> {
   const rows = this.connection.prepare(
-    `SELECT a.id, a.agent_id, a.fidelity_id, a.created_at,
+    `SELECT a.id, a.agent_id, a.fidelity_id, a.package_id, a.created_at,
         ag.name AS agent_name, ag.surname AS agent_surname, ag.username AS agent_username,
         co.id AS consumer_id, co.name AS consumer_name, co.surname AS consumer_surname, co.username AS consumer_username
      FROM assignations a
@@ -1038,6 +1116,7 @@ END;
   ).all(companyId) as RawRow[];
   return rows.map((row) => ({
     id: Number(row.id), agentId: Number(row.agent_id), fidelityId: Number(row.fidelity_id), createdAt: String(row.created_at),
+    packageId: row.package_id === null || row.package_id === undefined ? null : Number(row.package_id),
     agent: { id: Number(row.agent_id), name: String(row.agent_name), surname: String(row.agent_surname), username: String(row.agent_username) },
     consumer: { id: Number(row.consumer_id), name: String(row.consumer_name), surname: String(row.consumer_surname), username: String(row.consumer_username) },
   }));
@@ -1057,23 +1136,23 @@ END;
   if (limit === 0 || limit < -1) throw new Error("Room limit must be -1 or a positive integer");
   const now = this.nowIso();
   this.connection.prepare(
-    `INSERT INTO rooms (company_id, name, limit_count, active, created_at, updated_at)
-     VALUES (?, ?, ?, 1, ?, ?)`,
-  ).run(companyId, cleanName, limit, now, now);
+    `INSERT INTO rooms (company_id, name, limit_count, active, position, created_at, updated_at)
+     VALUES (?, ?, ?, 1, (SELECT COALESCE(MAX(position) + 1, 0) FROM rooms WHERE company_id = ?), ?, ?)`,
+  ).run(companyId, cleanName, limit, companyId, now, now);
   return this.getRoom(companyId, cleanName)!;
   }
 
   getRoom(companyId: number, name: string): Room | null {
   const row = this.connection.prepare(
-    "SELECT company_id, name, limit_count, active, created_at, updated_at FROM rooms WHERE company_id = ? AND name = ?",
+    "SELECT company_id, name, limit_count, active, position, created_at, updated_at FROM rooms WHERE company_id = ? AND name = ?",
   ).get(companyId, name) as RawRow | undefined;
   return row ? this.mapRoom(row) : null;
   }
 
   listRooms(companyId: number, includeInactive = false): Room[] {
   const rows = this.connection.prepare(
-    `SELECT company_id, name, limit_count, active, created_at, updated_at FROM rooms
-     WHERE company_id = ? AND (? = 1 OR active = 1) ORDER BY name COLLATE NOCASE`,
+    `SELECT company_id, name, limit_count, active, position, created_at, updated_at FROM rooms
+     WHERE company_id = ? AND (? = 1 OR active = 1) ORDER BY position, name COLLATE NOCASE`,
   ).all(companyId, includeInactive ? 1 : 0) as RawRow[];
   return rows.map((row) => this.mapRoom(row));
   }
@@ -1111,6 +1190,275 @@ END;
   /** Hard deletion is rejected by foreign keys while any historical meeting references the room. */
   deleteRoom(companyId: number, name: string): void {
   this.connection.prepare("DELETE FROM rooms WHERE company_id = ? AND name = ?").run(companyId, name);
+  }
+
+  /**
+   * Save the whole room list in one transaction: rename, new limit and new order (the array order is the display order).
+   * Either everything is saved or nothing is.
+   */
+  saveRooms(companyId: number, items: Array<{ name: string; newName?: string; limit: number }>): Room[] {
+  return this.withTransaction(() => {
+    const now = this.nowIso();
+    items.forEach((item, index) => {
+    let name = item.name;
+    const wanted = item.newName?.trim();
+    if (wanted && wanted !== name) name = this.renameRoom(companyId, name, wanted).name;
+    this.updateRoomLimit(companyId, name, item.limit);
+    this.connection.prepare("UPDATE rooms SET position = ?, updated_at = ? WHERE company_id = ? AND name = ?")
+      .run(index, now, companyId, name);
+    });
+    return this.listRooms(companyId);
+  });
+  }
+
+  /**
+   * Automatically give a room to the pending meetings that have none, between `from` and `to`.
+   * Rules:
+   *  - meetings that already have a room are never changed (they still count in the room capacity);
+   *  - rooms with limit -1 (unlimited) and inactive rooms are never used;
+   *  - an agent keeps one single room whenever possible; otherwise the room only changes when it has to;
+   *  - rooms the agent already uses (or last used) come first, then the order of the room list (admin preference).
+   */
+  autoAssignRooms(companyId: number, from: string | Date, to: string | Date): AutoAssignRoomsResult {
+  const start = this.normalizeIsoDate(from, "Range start");
+  const end = this.normalizeIsoDate(to, "Range end");
+  if (Date.parse(start) >= Date.parse(end)) throw new Error("Range end must be after range start");
+
+  return this.withTransaction(() => {
+    const rooms = this.listRooms(companyId).filter((room) => room.active && room.limit !== -1);
+    const keyOf = (name: string) => name.toLowerCase();
+
+    // Meetings of the period (not cancelled) with the agent who runs them.
+    const rows = this.connection.prepare(
+    `SELECT m.id, m.start_at, m.duration_minutes, m.room_name, m.status, a.agent_id
+     FROM meetings m
+     JOIN assignations a ON a.id = m.assignation_id
+     JOIN fidelities f ON f.id = a.fidelity_id
+     WHERE f.company_id = ? AND m.status <> 'canceledBy'
+     AND julianday(m.start_at, '+' || m.duration_minutes || ' minutes') > julianday(?)
+     AND julianday(m.start_at) < julianday(?)
+     ORDER BY m.start_at, m.id`,
+    ).all(companyId, start, end) as RawRow[];
+    const items = rows.map((row) => ({
+    id: Number(row.id), agentId: Number(row.agent_id),
+    s: Date.parse(String(row.start_at)), e: Date.parse(String(row.start_at)) + Number(row.duration_minutes) * 60_000,
+    room: row.room_name === null || row.room_name === undefined ? null : String(row.room_name),
+    pending: String(row.status) === "pending",
+    }));
+    const targets = items.filter((item) => item.room === null && item.pending);
+    if (!targets.length || !rooms.length) return { assigned: [], unassigned: targets.map((item) => item.id) };
+
+    // Room occupancy over the whole window covered by the targets (meetings may stick out of the period).
+    const winStart = new Date(Math.min(...targets.map((item) => item.s))).toISOString();
+    const winEnd = new Date(Math.max(...targets.map((item) => item.e))).toISOString();
+    const occupancyRows = this.connection.prepare(
+    `SELECT m.start_at, m.duration_minutes, m.room_name FROM meetings m
+     WHERE m.room_company_id = ? AND m.room_name IS NOT NULL AND m.status <> 'canceledBy'
+     AND julianday(m.start_at, '+' || m.duration_minutes || ' minutes') > julianday(?)
+     AND julianday(m.start_at) < julianday(?)`,
+    ).all(companyId, winStart, winEnd) as RawRow[];
+    const occupancy = new Map<string, Array<{ s: number; e: number }>>();
+    for (const row of occupancyRows) {
+    const key = keyOf(String(row.room_name));
+    const list = occupancy.get(key) ?? [];
+    list.push({ s: Date.parse(String(row.start_at)), e: Date.parse(String(row.start_at)) + Number(row.duration_minutes) * 60_000 });
+    occupancy.set(key, list);
+    }
+    const fits = (room: Room, s: number, e: number, extra: Array<{ s: number; e: number }> = []) =>
+    this.peakOfIntervals([...(occupancy.get(keyOf(room.name)) ?? []), ...extra], s, e) < room.limit;
+
+    // Group the targets by agent; agents with the most meetings are placed first (they are the hardest to keep in one room).
+    const byAgent = new Map<number, typeof targets>();
+    for (const target of targets) byAgent.set(target.agentId, [...(byAgent.get(target.agentId) ?? []), target]);
+    const agentIds = [...byAgent.keys()].sort((a, b) => byAgent.get(b)!.length - byAgent.get(a)!.length || a - b);
+
+    const lastRoomBefore = this.connection.prepare(
+    `SELECT m.room_name FROM meetings m
+     JOIN assignations a ON a.id = m.assignation_id
+     JOIN fidelities f ON f.id = a.fidelity_id
+     WHERE a.agent_id = ? AND f.company_id = ? AND m.room_name IS NOT NULL AND m.status <> 'canceledBy'
+     AND julianday(m.start_at) < julianday(?)
+     ORDER BY m.start_at DESC LIMIT 1`,
+    );
+
+    const decisions: Array<{ meetingId: number; room: Room }> = [];
+    const unassigned: number[] = [];
+    const reserve = (room: Room, item: { s: number; e: number }) => {
+    const key = keyOf(room.name);
+    occupancy.set(key, [...(occupancy.get(key) ?? []), { s: item.s, e: item.e }]);
+    };
+
+    for (const agentId of agentIds) {
+    const mine = byAgent.get(agentId)!.sort((a, b) => a.s - b.s || a.id - b.id);
+
+    // Rooms this agent already uses in the period, then the room used just before the period.
+    const used = new Map<string, number>();
+    for (const item of items) if (item.agentId === agentId && item.room) used.set(keyOf(item.room), (used.get(keyOf(item.room)) ?? 0) + 1);
+    const before = lastRoomBefore.get(agentId, companyId, start) as RawRow | undefined;
+    const beforeKey = before?.room_name ? keyOf(String(before.room_name)) : null;
+    const ranked = rooms
+      .map((room, index) => ({ room, index }))
+      .sort((a, b) =>
+      (used.get(keyOf(b.room.name)) ?? 0) - (used.get(keyOf(a.room.name)) ?? 0)
+      || Number(keyOf(b.room.name) === beforeKey) - Number(keyOf(a.room.name) === beforeKey)
+      || a.index - b.index)
+      .map((entry) => entry.room);
+
+    // 1) A single room for all the meetings of this agent: no room change at all.
+    const single = ranked.find((room) => {
+      const placed: Array<{ s: number; e: number }> = [];
+      for (const item of mine) {
+      if (!fits(room, item.s, item.e, placed)) return false;
+      placed.push({ s: item.s, e: item.e });
+      }
+      return true;
+    });
+    if (single) {
+      for (const item of mine) { reserve(single, item); decisions.push({ meetingId: item.id, room: single }); }
+      continue;
+    }
+
+    // 2) Otherwise go chronologically and only leave the current room when it is full.
+    let current: Room | null = ranked.find((room) => keyOf(room.name) === beforeKey) ?? null;
+    for (const item of mine) {
+      const candidates = current ? [current, ...ranked.filter((room) => room !== current)] : ranked;
+      const chosen = candidates.find((room) => fits(room, item.s, item.e));
+      if (!chosen) { unassigned.push(item.id); continue; }
+      reserve(chosen, item);
+      decisions.push({ meetingId: item.id, room: chosen });
+      current = chosen;
+    }
+    }
+
+    // Write the decisions; setMeetingRoom re-checks status and capacity against the database.
+    const assigned: Array<{ meetingId: number; roomName: string }> = [];
+    for (const decision of decisions) {
+    try {
+      this.setMeetingRoom(decision.meetingId, decision.room.name);
+      assigned.push({ meetingId: decision.meetingId, roomName: decision.room.name });
+    } catch {
+      unassigned.push(decision.meetingId);
+    }
+    }
+    return { assigned, unassigned };
+  });
+  }
+
+  /** Highest number of intervals overlapping at the same time inside [windowStart, windowEnd). */
+  private peakOfIntervals(intervals: Array<{ s: number; e: number }>, windowStart: number, windowEnd: number): number {
+  const events: Array<{ time: number; delta: number }> = [];
+  for (const interval of intervals) {
+    const s = Math.max(windowStart, interval.s);
+    const e = Math.min(windowEnd, interval.e);
+    if (e <= s) continue;
+    events.push({ time: s, delta: 1 }, { time: e, delta: -1 });
+  }
+  events.sort((left, right) => left.time - right.time || left.delta - right.delta);
+  let current = 0;
+  let peak = 0;
+  for (const event of events) {
+    current += event.delta;
+    peak = Math.max(peak, current);
+  }
+  return peak;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Packages (hourly-rate formulas)
+  // ---------------------------------------------------------------------------
+
+  createPackage(companyId: number, name: string, hourlyRate: number): Package {
+  const cleanName = this.requiredText(name, "Package name", 120);
+  this.assertRate(hourlyRate);
+  const result = this.connection.prepare(
+    "INSERT INTO packages (company_id, name, hourly_rate, created_at) VALUES (?, ?, ?, ?)",
+  ).run(companyId, cleanName, hourlyRate, this.nowIso());
+  return this.getPackageById(Number(result.lastInsertRowid))!;
+  }
+
+  getPackageById(id: number): Package | null {
+  const row = this.connection.prepare(
+    "SELECT id, company_id, name, hourly_rate, created_at FROM packages WHERE id = ?",
+  ).get(id) as RawRow | undefined;
+  return row ? this.mapPackage(row) : null;
+  }
+
+  listPackages(companyId: number): Package[] {
+  const rows = this.connection.prepare(
+    "SELECT id, company_id, name, hourly_rate, created_at FROM packages WHERE company_id = ? ORDER BY name COLLATE NOCASE",
+  ).all(companyId) as RawRow[];
+  return rows.map((row) => this.mapPackage(row));
+  }
+
+  /** Rejected by foreign keys while a consumer or an assignation still uses the package. */
+  deletePackage(id: number): void {
+  this.connection.prepare("DELETE FROM packages WHERE id = ?").run(id);
+  }
+
+  /** Set (or clear with null) the default package of a consumer in a company. Pending meetings follow the new rate. */
+  setFidelityDefaultPackage(fidelityId: number, packageId: number | null): Fidelity {
+  return this.withTransaction(() => {
+    const fidelity = this.getFidelityById(fidelityId);
+    if (!fidelity) throw new Error("Fidelity not found");
+    this.assertPackageInCompany(packageId, fidelity.companyId);
+    this.connection.prepare("UPDATE fidelities SET default_package_id = ? WHERE id = ?").run(packageId, fidelityId);
+    const assignations = this.connection.prepare("SELECT id FROM assignations WHERE fidelity_id = ?").all(fidelityId) as RawRow[];
+    this.refreshPendingMeetingRates(assignations.map((row) => Number(row.id)));
+    return this.getFidelityById(fidelityId)!;
+  });
+  }
+
+  /** Choose the package of an agent/consumer pair; null means "use the consumer's default package". */
+  setAssignationPackage(assignationId: number, packageId: number | null): Assignation {
+  return this.withTransaction(() => {
+    const assignation = this.getAssignationById(assignationId);
+    if (!assignation) throw new Error("Assignation not found");
+    const fidelity = this.getFidelityById(assignation.fidelityId);
+    if (!fidelity) throw new Error("Fidelity not found");
+    this.assertPackageInCompany(packageId, fidelity.companyId);
+    this.connection.prepare("UPDATE assignations SET package_id = ? WHERE id = ?").run(packageId, assignationId);
+    this.refreshPendingMeetingRates([assignationId]);
+    return this.getAssignationById(assignationId)!;
+  });
+  }
+
+  /** Hourly rate that applies to an assignation: its own package, else the consumer's default package, else 0. */
+  resolveHourlyRate(assignationId: number): number {
+  const row = this.connection.prepare(
+    `SELECT COALESCE(pa.hourly_rate, pf.hourly_rate, 0) AS rate
+     FROM assignations a
+     JOIN fidelities f ON f.id = a.fidelity_id
+     LEFT JOIN packages pa ON pa.id = a.package_id
+     LEFT JOIN packages pf ON pf.id = f.default_package_id
+     WHERE a.id = ?`,
+  ).get(assignationId) as RawRow | undefined;
+  return row ? Number(row.rate) : 0;
+  }
+
+  /** Pending meetings take the new rate; done and cancelled meetings keep the rate they were billed at. */
+  private refreshPendingMeetingRates(assignationIds: number[]): void {
+  const update = this.connection.prepare(
+    "UPDATE meetings SET hourly_rate = ?, updated_at = ? WHERE assignation_id = ? AND status = 'pending'",
+  );
+  const now = this.nowIso();
+  for (const assignationId of assignationIds) update.run(this.resolveHourlyRate(assignationId), now, assignationId);
+  }
+
+  private assertPackageInCompany(packageId: number | null, companyId: number): void {
+  if (packageId === null) return;
+  const pack = this.getPackageById(packageId);
+  if (!pack || pack.companyId !== companyId) throw new Error("Package not found for this company");
+  }
+
+  private assertRate(rate: number): void {
+  if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0) throw new Error("Hourly rate must be a number greater than or equal to 0");
+  }
+
+  private mapPackage(row: RawRow): Package {
+  return {
+    id: Number(row.id), companyId: Number(row.company_id), name: String(row.name),
+    hourlyRate: Number(row.hourly_rate), createdAt: String(row.created_at),
+  };
   }
 
   isRoomAvailable(companyId: number, name: string, startAt: string | Date, durationMinutes: number, excludeMeetingId?: number): boolean {
@@ -1609,12 +1957,12 @@ END;
     `INSERT INTO meetings (
        assignation_id, availability_request_id, source_contract_id,
        source_disponibility_love, source_suggestion_love, start_at, duration_minutes,
-       status, room_company_id, room_name, comment, idempotency_key, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+       status, room_company_id, room_name, comment, idempotency_key, hourly_rate, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
     input.assignationId, input.requestId, Number(suggestionRow.contract_id), Number(dispoRow.love),
     Number(suggestionRow.love), startAt, input.durationMinutes, roomCompanyId, roomName, comment,
-    idempotencyKey, now, now,
+    idempotencyKey, this.resolveHourlyRate(input.assignationId), now, now,
     );
     const meetingId = Number(insert.lastInsertRowid);
 
@@ -1672,9 +2020,10 @@ END;
     const now = this.nowIso();
     const result = this.connection.prepare(
     `INSERT INTO meetings (assignation_id, start_at, duration_minutes, status, room_company_id,
-      room_name, comment, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(input.assignationId, startAt, input.durationMinutes, status, roomCompanyId, roomName, comment, now, now);
+      room_name, comment, hourly_rate, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(input.assignationId, startAt, input.durationMinutes, status, roomCompanyId, roomName, comment,
+      this.resolveHourlyRate(input.assignationId), now, now);
     return this.getMeetingById(Number(result.lastInsertRowid))!;
   });
   }
@@ -2057,7 +2406,9 @@ END;
   private mapFidelity(row: RawRow): Fidelity {
   return {
     id: Number(row.id), key: String(row.key), companyId: Number(row.company_id), consumerId: Number(row.consumer_id),
-    active: Number(row.active) === 1, createdAt: String(row.created_at),
+    active: Number(row.active) === 1,
+    defaultPackageId: row.default_package_id === null || row.default_package_id === undefined ? null : Number(row.default_package_id),
+    createdAt: String(row.created_at),
   };
   }
 
@@ -2066,13 +2417,17 @@ END;
   }
 
   private mapAssignation(row: RawRow): Assignation {
-  return { id: Number(row.id), agentId: Number(row.agent_id), fidelityId: Number(row.fidelity_id), createdAt: String(row.created_at) };
+  return {
+    id: Number(row.id), agentId: Number(row.agent_id), fidelityId: Number(row.fidelity_id),
+    packageId: row.package_id === null || row.package_id === undefined ? null : Number(row.package_id),
+    createdAt: String(row.created_at),
+  };
   }
 
   private mapRoom(row: RawRow): Room {
   return {
     companyId: Number(row.company_id), name: String(row.name), limit: Number(row.limit_count), active: Number(row.active) === 1,
-    createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+    position: Number(row.position ?? 0), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
   }
 
@@ -2109,6 +2464,7 @@ END;
     startAt: String(row.start_at), durationMinutes: Number(row.duration_minutes), status: String(row.status) as MeetingStatus,
     roomCompanyId: row.room_company_id === null || row.room_company_id === undefined ? null : Number(row.room_company_id),
     roomName: row.room_name === null || row.room_name === undefined ? null : String(row.room_name),
+    hourlyRate: Number(row.hourly_rate ?? 0),
     comment: String(row.comment ?? ""),
     canceledByRole: row.canceled_by_role === null || row.canceled_by_role === undefined ? null : String(row.canceled_by_role) as Role,
     canceledById: row.canceled_by_id === null || row.canceled_by_id === undefined ? null : Number(row.canceled_by_id),

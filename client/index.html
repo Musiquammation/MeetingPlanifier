@@ -19,6 +19,8 @@
 				<li><a href="#admin-consumers" :aria-current="page === 'admin-consumers' ? 'page' : null">Consommateurs</a></li>
 				<li><a href="#admin-agents" :aria-current="page === 'admin-agents' ? 'page' : null">Agents</a></li>
 				<li><a href="#admin-rooms" :aria-current="page === 'admin-rooms' ? 'page' : null">Salles</a></li>
+				<li><a href="#admin-packages" :aria-current="page === 'admin-packages' ? 'page' : null">Formules</a></li>
+				<li><a href="#admin-results" :aria-current="page === 'admin-results' ? 'page' : null">Résultats</a></li>
 			</ul>
 		</template>
 		<template x-if="role === 'agent'">
@@ -165,10 +167,18 @@
 			<template x-if="consumers.length">
 				<div role="region" tabindex="0" aria-label="Consommateurs">
 					<table>
-						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Clé d’accès</th></tr></thead>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Clé d’accès</th><th>Formule par défaut</th></tr></thead>
 						<tbody>
 							<template x-for="c in consumers" :key="consumerKey(c)">
-								<tr><td x-text="consumerLabel(c)"></td><td x-text="consumerOf(c).username"></td><td x-text="fidelityKey(c)"></td></tr>
+								<tr>
+									<td x-text="consumerLabel(c)"></td><td x-text="consumerOf(c).username"></td><td x-text="fidelityKey(c)"></td>
+									<td>
+										<select :aria-label="'Formule par défaut de ' + consumerLabel(c)" @change="setConsumerPackage(c, $event.target.value)" :disabled="busy">
+											<option value="" :selected="defaultPackageId(c) === null" x-text="'Aucune (' + money(0) + ')'"></option>
+											<template x-for="p in packages" :key="p.id"><option :value="p.id" :selected="p.id === defaultPackageId(c)" x-text="packageLabel(p)"></option></template>
+										</select>
+									</td>
+								</tr>
 							</template>
 						</tbody>
 					</table>
@@ -180,6 +190,26 @@
 	<template x-if="page === 'admin-agents'">
 		<section>
 			<h1>Agents</h1>
+
+			<!-- Attribute one more consumer to an agent (opened from the agent's list of consumers) -->
+			<dialog id="assign-dialog" aria-labelledby="assign-title" @close="assignDialog.agent = null">
+				<form @submit.prevent="confirmAssign()">
+					<h2 id="assign-title">Attribuer un consommateur</h2>
+					<template x-if="assignDialog.agent"><p>Agent : <b x-text="agentLabel(assignDialog.agent)"></b></p></template>
+					<label>Rechercher <input type="search" x-model="assignDialog.q" placeholder="Nom, prénom ou utilisateur" autocomplete="off"></label>
+					<label>Consommateur
+						<select size="6" x-model="assignDialog.fidelityId" required>
+							<template x-for="c in assignableConsumers()" :key="fidelityId(c)"><option :value="fidelityId(c)" x-text="consumerLabel(c) + ' (' + consumerOf(c).username + ')'"></option></template>
+						</select>
+					</label>
+					<template x-if="!assignableConsumers().length"><p>Aucun consommateur à attribuer.</p></template>
+					<template x-if="assignDialog.error"><p role="alert" data-tone="error" x-text="assignDialog.error"></p></template>
+					<p data-actions>
+						<button type="submit" :disabled="busy || !assignDialog.fidelityId">Attribuer</button>
+						<button type="button" @click="closeAssign()">Annuler</button>
+					</p>
+				</form>
+			</dialog>
 
 			<h2>1. Chercher un agent existant</h2>
 			<form @submit.prevent="searchAgents()" role="search">
@@ -216,23 +246,6 @@
 				<button type="submit" :disabled="busy">Créer l’agent</button>
 			</form>
 
-			<h2>Assigner un agent à un consommateur</h2>
-			<form @submit.prevent="assign()">
-				<label>Agent
-					<select x-model="form.agentId" required>
-						<option value="">Choisir…</option>
-						<template x-for="a in agents" :key="a.id"><option :value="a.id" x-text="agentLabel(a)"></option></template>
-					</select>
-				</label>
-				<label>Consommateur
-					<select x-model="form.fidelityId" required>
-						<option value="">Choisir…</option>
-						<template x-for="c in consumers" :key="fidelityId(c)"><option :value="fidelityId(c)" x-text="consumerLabel(c)"></option></template>
-					</select>
-				</label>
-				<button type="submit" :disabled="busy">Assigner</button>
-			</form>
-
 			<h2>Agents de ma société</h2>
 			<template x-if="!loading && !agents.length"><p>Aucun agent pour l’instant.</p></template>
 			<template x-if="agents.length">
@@ -254,12 +267,20 @@
 									<tr data-sub>
 										<td x-text="'↳ ' + consumerLabel(x)"></td>
 										<td x-text="consumerOf(x).username"></td>
-										<td></td>
+										<td>
+											<select :aria-label="'Prix horaire de ' + consumerLabel(x)" @change="setAssignationPackage(x, $event.target.value)" :disabled="busy">
+												<option value="" :selected="x.packageId === null" x-text="defaultOptionLabel(x)"></option>
+												<template x-for="p in packages" :key="p.id"><option :value="p.id" :selected="p.id === x.packageId" x-text="packageLabel(p)"></option></template>
+											</select>
+										</td>
 										<td><button type="button" data-variant="danger" @click="removeAssignation(x)" :disabled="busy">Supprimer</button></td>
 									</tr>
 								</template>
 								<template x-if="openAgent === a.id && !assignationsOf(a).length">
 									<tr data-sub><td colspan="4">Aucun consommateur assigné.</td></tr>
+								</template>
+								<template x-if="openAgent === a.id">
+									<tr data-sub><td colspan="4"><button type="button" @click="openAssign(a)" :disabled="busy">Attribuer un autre consommateur</button></td></tr>
 								</template>
 							</tbody>
 						</template>
@@ -277,26 +298,157 @@
 				<label>Nombre de cours en même temps (-1 = illimité) <input type="number" min="-1" step="1" x-model="form.limit" placeholder="-1"></label>
 				<button type="submit" :disabled="busy">Ajouter la salle</button>
 			</form>
+
+			<h2>Liste des salles</h2>
 			<template x-if="!loading && !rooms.length"><p>Aucune salle. Ajoutez la première ci-dessus.</p></template>
 			<template x-if="rooms.length">
-				<div role="region" tabindex="0" aria-label="Salles">
+				<div>
+					<p>Glissez la poignée ⠿ (ou utilisez les flèches) pour changer l’ordre : c’est l’ordre de préférence de l’attribution automatique. Rien n’est enregistré avant d’avoir cliqué sur « Enregistrer ».</p>
+					<div role="region" tabindex="0" aria-label="Salles">
+						<table>
+							<thead><tr><th>Ordre</th><th>Nom</th><th>Limite</th><th>État</th><th></th></tr></thead>
+							<tbody>
+								<template x-for="(r, i) in rooms" :key="r.name">
+									<tr :data-drop="overRoom === i && dragRoom !== null && dragRoom !== i" :data-dragging="dragRoom === i" @dragover="roomDragOver($event, i)" @drop="roomDrop($event, i)">
+										<td>
+											<span data-handle draggable="true" title="Glisser pour changer l’ordre" @dragstart="roomDragStart($event, i)" @dragend="roomDragEnd()">⠿</span>
+											<button type="button" @click="moveRoom(i, i - 1)" :disabled="i === 0" :aria-label="'Monter ' + r.name">↑</button>
+											<button type="button" @click="moveRoom(i, i + 1)" :disabled="i === rooms.length - 1" :aria-label="'Descendre ' + r.name">↓</button>
+										</td>
+										<td><input x-model="r.draftName" :aria-label="'Nom de ' + r.name" maxlength="100"></td>
+										<td><input type="number" min="-1" step="1" x-model.number="r.draftLimit" :aria-label="'Limite de ' + r.name"></td>
+										<td x-text="r.active === false ? 'Désactivée' : 'Active'"></td>
+										<td><button type="button" data-variant="danger" @click="deactivateRoom(r)" :disabled="busy || r.active === false">Désactiver</button></td>
+									</tr>
+								</template>
+							</tbody>
+						</table>
+					</div>
+					<p data-savebar><button type="button" @click="saveRooms()" :disabled="busy">Enregistrer</button></p>
+				</div>
+			</template>
+
+			<h2>Attribuer les salles automatiquement</h2>
+			<p>Donne une salle aux rendez-vous en attente qui n’en ont pas encore, sur la période choisie (par exemple le 26 octobre de 8 h à 13 h). Les rendez-vous qui ont déjà une salle ne changent pas, les salles illimitées (-1) ne sont jamais utilisées, et chaque agent garde autant que possible la même salle.</p>
+			<form @submit.prevent="autoAssignRooms()">
+				<label>Début de la période <input type="datetime-local" step="900" x-model="form.autoFrom" required></label>
+				<label>Fin de la période <input type="datetime-local" step="900" x-model="form.autoTo" required></label>
+				<button type="submit" :disabled="busy || !rooms.length">Attribuer automatiquement</button>
+			</form>
+
+			<h2>Calendrier des salles</h2>
+			<div data-cal data-roomcal x-place="{'--days': roomColumns().length, '--hours': roomCal.hours.length}">
+				<div role="toolbar" aria-label="Navigation du calendrier des salles" data-toolbar>
+					<div role="group" aria-label="Jour">
+						<button type="button" @click="roomCal.prev()" aria-label="Jour précédent">‹</button>
+						<button type="button" @click="roomCal.today()">Aujourd’hui</button>
+						<button type="button" @click="roomCal.next()" aria-label="Jour suivant">›</button>
+					</div>
+					<p data-range aria-live="polite" x-text="roomCal.title"></p>
+					<label>Aller à <input type="date" @change="roomCal.goTo($event.target.value)"></label>
+					<label>De <input type="number" min="0" max="22" x-model.number="roomCal.settings.startHour" @change="applyRoomHours()" aria-label="Première heure affichée"> h à <input type="number" min="1" max="24" x-model.number="roomCal.settings.endHour" @change="applyRoomHours()" aria-label="Dernière heure affichée"> h</label>
+				</div>
+				<div data-scroll :aria-busy="loading">
+					<div data-head>
+						<span></span>
+						<template x-for="col in roomColumns()" :key="col.key"><span data-day-head x-text="col.label"></span></template>
+					</div>
+					<div data-grid>
+						<ol data-hours aria-hidden="true">
+							<template x-for="h in roomCal.hours" :key="h"><li x-text="h + ' h'"></li></template>
+						</ol>
+						<template x-for="col in roomColumns()" :key="col.key">
+							<div data-day role="group" :aria-label="col.label">
+								<template x-for="p in roomColumnEvents(col.name)" :key="p.ev.id">
+									<div data-event data-kind="meeting" :data-status="p.ev.status" x-place="roomCal.place(p)"
+										:title="p.ev.title + ', de ' + roomCal.time(p.ev.start) + ' à ' + roomCal.time(p.ev.end)">
+										<b x-text="p.ev.title"></b>
+										<time x-text="roomCal.time(p.ev.start) + ' – ' + roomCal.time(p.ev.end)"></time>
+									</div>
+								</template>
+							</div>
+						</template>
+					</div>
+				</div>
+			</div>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-packages'">
+		<section>
+			<h1>Formules</h1>
+			<p>Une formule est un prix horaire. Elle est choisie par défaut pour chaque consommateur (page Consommateurs), puis peut être remplacée pour un agent précis (page Agents).</p>
+			<form @submit.prevent="createPackage()">
+				<label>Nom de la formule <input x-model="form.name" required maxlength="120"></label>
+				<label>Prix horaire (€) <input type="number" min="0" step="0.01" x-model="form.hourlyRate" required></label>
+				<button type="submit" :disabled="busy">Créer la formule</button>
+			</form>
+
+			<h2>Formules de ma société</h2>
+			<template x-if="!loading && !packages.length"><p>Aucune formule pour l’instant. Créez la première ci-dessus.</p></template>
+			<template x-if="packages.length">
+				<div role="region" tabindex="0" aria-label="Formules">
 					<table>
-						<thead><tr><th>Nom</th><th>Limite</th><th>État</th><th></th></tr></thead>
+						<thead><tr><th>Nom</th><th>Prix horaire</th><th></th></tr></thead>
 						<tbody>
-							<template x-for="r in rooms" :key="r.name">
+							<template x-for="p in packages" :key="p.id">
 								<tr>
-									<td><input x-model="r.draftName" :aria-label="'Nom de ' + r.name" maxlength="100"></td>
-									<td><input type="number" min="-1" step="1" x-model.number="r.draftLimit" :aria-label="'Limite de ' + r.name"></td>
-									<td x-text="r.active === false ? 'Désactivée' : 'Active'"></td>
-									<td>
-										<button type="button" @click="saveRoom(r)" :disabled="busy">Enregistrer</button>
-										<button type="button" data-variant="danger" @click="deactivateRoom(r)" :disabled="busy || r.active === false">Désactiver</button>
-									</td>
+									<td x-text="p.name"></td>
+									<td x-text="money(p.hourlyRate) + ' / h'"></td>
+									<td><button type="button" data-variant="danger" @click="deletePackage(p)" :disabled="busy">Supprimer</button></td>
 								</tr>
 							</template>
 						</tbody>
 					</table>
 				</div>
+			</template>
+		</section>
+	</template>
+
+	<template x-if="page === 'admin-results'">
+		<section>
+			<h1>Résultats</h1>
+			<p>Rendez-vous non annulés, un tableau par mois. Prix = prix horaire × durée (en heures).</p>
+
+			<fieldset data-consumers>
+				<legend>Agents affichés</legend>
+				<label><input type="checkbox" :checked="agents.every(a => !isAgentHidden(a.id))" @change="setAllAgents($event.target.checked)"> Tous</label>
+				<template x-for="a in agents" :key="a.id">
+					<label><input type="checkbox" :checked="!isAgentHidden(a.id)" @change="toggleAgentFilter(a.id)"> <span x-text="agentLabel(a)"></span></label>
+				</template>
+			</fieldset>
+			<fieldset data-consumers>
+				<legend>Consommateurs affichés</legend>
+				<label><input type="checkbox" :checked="consumers.every(c => !isConsumerHidden(consumerOf(c).id))" @change="setAllResultConsumers($event.target.checked)"> Tous</label>
+				<template x-for="c in consumers" :key="consumerKey(c)">
+					<label><input type="checkbox" :checked="!isConsumerHidden(consumerOf(c).id)" @change="toggleConsumerFilter(consumerOf(c).id)"> <span x-text="consumerLabel(c)"></span></label>
+				</template>
+			</fieldset>
+
+			<template x-if="!loading && !resultMonths().length"><p>Aucun rendez-vous à afficher.</p></template>
+			<template x-for="mo in resultMonths()" :key="mo.key">
+				<section>
+					<h2 data-month x-text="mo.label"></h2>
+					<div role="region" tabindex="0" :aria-label="'Résultats de ' + mo.label">
+						<table>
+							<thead><tr><th>Agent</th><th>Consommateur</th><th>Début</th><th>Prix horaire</th><th>Durée</th><th>Durée (h)</th><th>Prix</th></tr></thead>
+							<tbody>
+								<template x-for="r in mo.rows" :key="r.id">
+									<tr>
+										<td x-text="r.agent"></td>
+										<td x-text="r.consumer"></td>
+										<td x-text="fmt(r.start)"></td>
+										<td x-text="money(r.rate) + ' / h'"></td>
+										<td x-text="r.minutes + ' min'"></td>
+										<td x-text="hoursLabel(r.hours)"></td>
+										<td x-text="money(r.price)"></td>
+									</tr>
+								</template>
+							</tbody>
+							<tfoot><tr><th colspan="6">Total du mois</th><th x-text="money(mo.total)"></th></tr></tfoot>
+						</table>
+					</div>
+				</section>
 			</template>
 		</section>
 	</template>
@@ -425,10 +577,32 @@
 			<template x-if="upcoming().length">
 				<div role="region" tabindex="0" aria-label="Prochains rendez-vous">
 					<table>
-						<thead><tr><th>Date</th><th>Durée</th><th>Salle</th><th>Statut</th></tr></thead>
+						<thead><tr>
+							<th>Date</th><th>Durée</th>
+							<template x-if="role === 'admin'"><th>Agent</th></template>
+							<template x-if="role === 'admin'"><th>Client</th></template>
+							<th>Salle</th><th>Statut</th>
+						</tr></thead>
 						<tbody>
 							<template x-for="m in upcoming()" :key="m.id">
-								<tr><td x-text="fmt(m.startAt)"></td><td x-text="m.durationMinutes + ' min'"></td><td x-text="roomOf(m)"></td><td x-text="statusLabel(m.status)"></td></tr>
+								<tr>
+									<td x-text="fmt(m.startAt)"></td>
+									<td x-text="m.durationMinutes + ' min'"></td>
+									<template x-if="role === 'admin'"><td x-text="meetingAgent(m)"></td></template>
+									<template x-if="role === 'admin'"><td x-text="meetingConsumer(m)"></td></template>
+									<td>
+										<template x-if="role !== 'admin'"><span x-text="roomOf(m)"></span></template>
+										<template x-if="role === 'admin'">
+											<select :aria-label="'Salle du rendez-vous du ' + fmt(m.startAt)" @change="setMeetingRoom(m, $event.target)" :disabled="busy">
+												<option value="" :selected="!m.roomName">Sans salle</option>
+												<template x-for="r in rooms" :key="r.name">
+													<option :value="r.name" :selected="r.name === m.roomName" :disabled="roomFull(r, m)" x-text="r.name + (roomFull(r, m) ? ' (complète)' : '')"></option>
+												</template>
+											</select>
+										</template>
+									</td>
+									<td x-text="statusLabel(m.status)"></td>
+								</tr>
 							</template>
 						</tbody>
 					</table>

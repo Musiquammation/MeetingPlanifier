@@ -109,7 +109,20 @@ export class Fetcher {
 	renameRoom(name: string, newName: string) { return this.patch(`/api/rooms/${encodeURIComponent(name)}`, { newName }); }
 	updateRoomLimit(name: string, limit: number) { return this.patch(`/api/rooms/${encodeURIComponent(name)}`, { limit }); }
 	deactivateRoom(name: string) { return this.del(`/api/rooms/${encodeURIComponent(name)}`); }
+	/** Saves every room in one request: the array order is the display order. */
+	saveRooms(rooms: Array<{ name: string; newName?: string; limit: number }>) { return this.request<any[]>("PUT", "/api/rooms", { body: { rooms } }); }
+	/** Gives a room to the room-less pending meetings of a period (rooms with limit -1 are never used). */
+	autoAssignRooms(from: string, to: string) { return this.post<{ assigned: Array<{ meetingId: number; roomName: string }>; unassigned: number[] }>("/api/rooms/auto-assign", { from, to }); }
 	roomsAvailability(startAt: string, durationMinutes: number) { return this.get<any[]>("/api/rooms/availability", { startAt, durationMinutes }); }
+
+	// ---- Packages (hourly-rate formulas) ----------------------------------
+	packages() { return this.get<any[]>("/api/packages"); }
+	createPackage(name: string, hourlyRate: number) { return this.post("/api/packages", { name, hourlyRate }); }
+	deletePackage(id: number) { return this.del(`/api/packages/${id}`); }
+	/** Default package of a consumer in the admin's company (null = not defined, price 0). */
+	setConsumerPackage(fidelityId: number, defaultPackageId: number | null) { return this.patch(`/api/fidelities/${fidelityId}`, { defaultPackageId }); }
+	/** Package of an agent/consumer pair (null = the consumer's default package). */
+	setAssignationPackage(assignationId: number, packageId: number | null) { return this.patch(`/api/assignations/${assignationId}`, { packageId }); }
 
 	// ---- Agenda ---------------------------------------------------------
 	agenda(from: string, to: string) { return this.get("/api/agenda", { from, to }); }
