@@ -4,6 +4,7 @@
 
 import Alpine from "alpinejs";
 import { Calendar, addDays, toLocalInput, type CalEvent, type EventKind } from "./Calendar";
+import { ResultsView } from "./Results";
 import { fetcher } from "./fetcher";
 import type { AvailabilityRequest, Company, Meeting, Package, Page, Role, Room } from "./types";
 
@@ -14,10 +15,15 @@ const PAGES: Record<Page, Role | null> = {
 	"admin-dashboard": "admin", "admin-companies": "admin", "admin-consumers": "admin", "admin-agents": "admin", "admin-rooms": "admin",
 	"admin-packages": "admin", "admin-results": "admin",
 	"agent-welcome": null, "agent-login": null, "agent-signup": null,
-	"agent-dashboard": "agent", "agent-companies": "agent", "agent-consumers": "agent", "agent-agenda": "agent",
+	"agent-dashboard": "agent", "agent-companies": "agent", "agent-consumers": "agent", "agent-agenda": "agent", "agent-results": "agent",
 	"consumer-welcome": null, "consumer-access": null,
 	"consumer-dashboard": "consumer", "consumer-agenda": "consumer"
 };
+/** Period wide enough to get every meeting, whatever its date (results pages). */
+const ALL_FROM = "2000-01-01T00:00:00.000Z";
+const ALL_TO = "2100-01-01T00:00:00.000Z";
+/** Default percentage the company takes on the agent (same value as the server). */
+const DEFAULT_SOCIETY_RATE = 28;
 const HOME: Record<Role, Page> = { admin: "admin-dashboard", agent: "agent-dashboard", consumer: "consumer-dashboard" };
 const STATUS: Record<string, string> = { pending: "En attente", done: "Terminé", canceledBy: "Annulé" };
 const KIND: Record<EventKind, string> = { meeting: "Rendez-vous", dispo: "Disponibilité", suggestion: "Suggestion", slot: "Créneau de l’agent" };
@@ -73,10 +79,10 @@ export class DomHandler {
 	roomCal = new Calendar(); // one day, one column per room (never persisted: see applyRoomHours)
 	roomMeetings: Meeting[] = [];
 	assignDialog: { agent: any; q: string; fidelityId: string; error: string } = { agent: null, q: "", fidelityId: "", error: "" };
-	// Results page: agents and consumers the admin chose to hide
-	resultMeetings: Meeting[] = [];
-	hiddenAgents: Record<number, boolean> = {};
-	hiddenConsumers: Record<number, boolean> = {};
+	// Results pages (admin and agent share the same view model: filters, sorting, months, money split)
+	res = new ResultsView();
+	// Agent agenda: only show the consumers who still ask for hours
+	onlyRequesters = false;
 
 	cal = new Calendar();
 
@@ -136,8 +142,8 @@ export class DomHandler {
 		this.meetings = []; this.consumers = []; this.agents = []; this.rooms = []; this.dispos = [];
 		this.suggestions = []; this.slots = []; this.requests = []; this.agentsList = []; this.selAssign = null; this.assignations = []; this.showDispo = {};
 		this.cal.events = [];
-		this.packages = []; this.roomMeetings = []; this.resultMeetings = []; this.roomCal.events = [];
-		this.hiddenAgents = {}; this.hiddenConsumers = {};
+		this.packages = []; this.roomMeetings = []; this.res.clear(); this.roomCal.events = [];
+		this.onlyRequesters = false;
 	}
 
 	async logout(): Promise<void> {
@@ -197,7 +203,10 @@ export class DomHandler {
 					this.meetings = a.meetings ?? []; this.consumers = c; this.agents = ag; this.assignations = asg; this.rooms = rooms;
 				});
 			case "admin-companies": case "agent-companies":
-				return this.load(async () => { this.companies = await fetcher.companies(); });
+				return this.load(async () => {
+					this.companies = await fetcher.companies();
+					if (this.role === "admin") this.form.societyRate = this.companies[0]?.societyRate ?? DEFAULT_SOCIETY_RATE;
+				});
 			case "admin-consumers":
 				return this.load(async () => { [this.consumers, this.agents, this.packages] = await Promise.all([fetcher.consumers(), fetcher.agents(), fetcher.packages()]); });
 			case "admin-agents":
@@ -207,6 +216,7 @@ export class DomHandler {
 				// The room calendar shows one day; its settings are local to the page and never saved.
 				this.roomCal.settings = { ...this.roomCal.settings, mode: "days", daysCount: 1 };
 				this.roomCal.onRange = () => void this.load(() => this.loadRoomCalendar());
+				this.form = { ...this.form, ...this.roomPeriodDefaults() }; // period to plan: today, 7:00 to 22:00
 				return this.load(async () => {
 					this.assignations = await fetcher.assignations();
 					await this.loadRooms();
@@ -216,9 +226,15 @@ export class DomHandler {
 				return this.load(async () => { this.packages = await fetcher.packages(); });
 			case "admin-results":
 				return this.load(async () => {
-					// Every meeting of the company, whatever its date.
-					const [a, c, ag, asg] = await Promise.all([fetcher.agenda("2000-01-01T00:00:00.000Z", "2100-01-01T00:00:00.000Z"), fetcher.consumers(), fetcher.agents(), fetcher.assignations()]);
-					this.resultMeetings = a.meetings ?? []; this.consumers = c; this.agents = ag; this.assignations = asg;
+					// Every meeting of the company, whatever its date; the assignations give the agent and the consumer of each one.
+					const [a, asg] = await Promise.all([fetcher.agenda(ALL_FROM, ALL_TO), fetcher.assignations()]);
+					this.res.setData("admin", a.meetings ?? [], asg);
+				});
+			case "agent-results":
+				return this.load(async () => {
+					// The server only sends the agent his own meetings, and only his own share of the money.
+					const a = await fetcher.agenda(ALL_FROM, ALL_TO);
+					this.res.setData("agent", a.meetings ?? [], a.assignations ?? []);
 				});
 			case "agent-consumers":
 				return this.load(async () => { this.assignations = await fetcher.myConsumers(); });
@@ -254,12 +270,31 @@ export class DomHandler {
 	consumerLabel(c: any): string { const x = this.consumerOf(c); return [x.name, x.surname].filter(Boolean).join(" ") || "Consommateur"; }
 	assignationsOf(a: any): any[] { return this.assignations.filter((x) => (x.agentId ?? x.agent?.id) === a.id); }
 	isShown(assignationId: number): boolean { return this.showDispo[assignationId] !== false; }
+	/**
+	 * A consumer is "requesting" when one of his requests is still open with hours left to schedule
+	 * (a request without limit counts: he wants meetings and nothing has capped them).
+	 */
+	isRequester(assignationId: number): boolean {
+		return this.requests.some((r) => r.assignationId === assignationId && (r.status ?? "open") === "open"
+			&& (r.remainingMinutes ?? Math.round((r.requestedHours - (r.scheduledHours ?? 0)) * 60)) > 0);
+	}
+	/** Consumers listed in the agent agenda: everybody, or only the requesting ones when "Demandeurs" is checked. */
+	visibleAssignations(): any[] { return this.onlyRequesters ? this.assignations.filter((x) => this.isRequester(x.id)) : this.assignations; }
+	/** True when the availabilities of this consumer are drawn in the agent agenda. */
+	isVisible(assignationId: number): boolean { return this.isShown(assignationId) && (!this.onlyRequesters || this.isRequester(assignationId)); }
+	toggleRequesters(): void {
+		this.onlyRequesters = !this.onlyRequesters;
+		this.cal.events = this.buildEvents();
+	}
 	toggleConsumer(assignationId: number): void {
 		this.showDispo = { ...this.showDispo, [assignationId]: !this.isShown(assignationId) };
 		this.cal.events = this.buildEvents();
 	}
+	/** "Tous": applies to the consumers currently listed (all of them, or only the requesting ones). */
 	setAllConsumers(on: boolean): void {
-		this.showDispo = Object.fromEntries(this.assignations.map((x) => [x.id, on]));
+		const next = { ...this.showDispo };
+		for (const x of this.visibleAssignations()) next[x.id] = on;
+		this.showDispo = next;
 		this.cal.events = this.buildEvents();
 	}
 	/** Agent: open the agenda showing only this consumer's availabilities. */
@@ -519,7 +554,7 @@ export class DomHandler {
 			const limit = Number(this.form.limit ?? -1);
 			if (!Number.isInteger(limit) || (limit !== -1 && limit < 1)) throw new Error("La limite vaut -1 (illimitée) ou un entier positif.");
 			await fetcher.createRoom(String(this.form.name ?? ""), limit);
-			this.form = {};
+			this.form = { autoFrom: this.form.autoFrom, autoTo: this.form.autoTo }; // keep the period of the automatic assignment
 			await this.loadRooms();
 		}, "Salle créée.");
 	}
@@ -597,6 +632,13 @@ export class DomHandler {
 		s.endHour = Math.min(24, Math.max(s.startHour + 1, Math.round(Number(s.endHour)) || 24));
 	}
 
+	/** Default period of the automatic room assignment: today, from 7:00 to 22:00. */
+	private roomPeriodDefaults(): { autoFrom: string; autoTo: string } {
+		const from = new Date(); from.setHours(7, 0, 0, 0);
+		const to = new Date(); to.setHours(22, 0, 0, 0);
+		return { autoFrom: toLocalInput(from), autoTo: toLocalInput(to) };
+	}
+
 	/** Automatic room assignment over the period typed in the form. */
 	async autoAssignRooms() {
 		await this.run(async () => {
@@ -613,34 +655,47 @@ export class DomHandler {
 		});
 	}
 
-	// ---- Results: one table per month ------------------------------------------
-	isAgentHidden(id: number): boolean { return this.hiddenAgents[id] === true; }
-	isConsumerHidden(id: number): boolean { return this.hiddenConsumers[id] === true; }
-	toggleAgentFilter(id: number) { this.hiddenAgents = { ...this.hiddenAgents, [id]: !this.isAgentHidden(id) }; }
-	toggleConsumerFilter(id: number) { this.hiddenConsumers = { ...this.hiddenConsumers, [id]: !this.isConsumerHidden(id) }; }
-	setAllAgents(on: boolean) { this.hiddenAgents = Object.fromEntries(this.agents.map((a) => [a.id, !on])); }
-	setAllResultConsumers(on: boolean) { this.hiddenConsumers = Object.fromEntries(this.consumers.map((c) => [this.consumerOf(c).id, !on])); }
-
-	/** Meetings grouped by month (newest month first), after the agent/consumer filters. Cancelled meetings are not billed. */
-	resultMonths(): Array<{ key: string; label: string; rows: any[]; total: number }> {
-		const months = new Map<string, { key: string; label: string; rows: any[]; total: number }>();
-		for (const m of this.resultMeetings) {
-			if (m.status === "canceledBy") continue;
-			const a = this.assignationOf(m);
-			if (!a || this.isAgentHidden(a.agent.id) || this.isConsumerHidden(a.consumer.id)) continue;
-			const d = new Date(m.startAt);
-			const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-			if (!months.has(key)) months.set(key, { key, label: d.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }), rows: [], total: 0 });
-			const month = months.get(key)!;
-			const rate = m.hourlyRate ?? 0;
-			const price = rate * m.durationMinutes / 60; // hourly rate x duration in hours
-			month.rows.push({ id: m.id, agent: this.agentLabel(a), consumer: this.consumerLabel(a), start: m.startAt, rate, minutes: m.durationMinutes, hours: m.durationMinutes / 60, price });
-			month.total += price;
-		}
-		for (const month of months.values()) month.rows.sort((x, y) => Date.parse(x.start) - Date.parse(y.start));
-		return [...months.values()].sort((x, y) => (x.key < y.key ? 1 : -1));
-	}
+	// ---- Results (admin-results and agent-results share Results.ts and one HTML block) ----------
 	hoursLabel(h: number): string { return `${Math.round(h * 100) / 100} h`; }
+
+	private async reloadResults(): Promise<void> {
+		const a = await fetcher.agenda(ALL_FROM, ALL_TO);
+		this.res.setData(this.res.mode, a.meetings ?? [], this.res.assignations);
+	}
+
+	/** The only changes allowed from the results: validate, cancel or comment a pending meeting. */
+	async resultDone(id: number) {
+		await this.run(async () => { await fetcher.patchMeeting(id, { status: "done" }); await this.reloadResults(); }, "Rendez-vous marqué comme terminé.");
+	}
+	async resultCancel(id: number) {
+		if (!confirm("Annuler ce rendez-vous ?")) return;
+		await this.run(async () => { await fetcher.cancelMeeting(id); await this.reloadResults(); }, "Rendez-vous annulé.");
+	}
+	async resultComment(id: number, text: string) {
+		await this.run(async () => { await fetcher.patchMeeting(id, { comment: text }); await this.reloadResults(); }, "Commentaire enregistré.");
+	}
+
+	// ---- Society rate (page Société) ---------------------------------------------------------------
+	/** Example shown under the field: what a 32 EUR price becomes for the agent and for the company. */
+	societyExample(): string {
+		const rate = Number(String(this.form.societyRate ?? "").replace(",", "."));
+		if (!Number.isFinite(rate) || rate < 0) return "";
+		const price = 32;
+		const agent = Math.round(price / (1 + rate / 100) * 100) / 100;
+		const society = Math.round((price - agent) * 100) / 100;
+		return `Exemple : si une formule coûte ${this.money(price)}, l’agent reçoit ${this.money(agent)} et la société ${this.money(society)}.`;
+	}
+
+	async saveSocietyRate() {
+		await this.run(async () => {
+			const rate = Number(String(this.form.societyRate ?? "").replace(",", "."));
+			if (!Number.isFinite(rate) || rate < 0 || rate > 1000) throw new Error("Le taux doit être un nombre entre 0 et 1000 (en pourcentage).");
+			const c = await fetcher.updateSocietyRate(rate);
+			if (this.company) this.company = { ...this.company, ...c };
+			this.companies = await fetcher.companies();
+			this.form.societyRate = this.companies[0]?.societyRate ?? rate;
+		}, "Taux de la société enregistré.");
+	}
 
 	async deactivateRoom(r: Room) {
 		if (!confirm(`Désactiver la salle « ${r.name} » ?`)) return;
@@ -662,6 +717,7 @@ export class DomHandler {
 			this.meetings = a.meetings ?? [];
 			if (this.role === "agent") {
 				this.contracts = a.contracts ?? []; this.assignations = a.assignations ?? []; this.suggestions = a.suggestions ?? [];
+				this.requests = (a.requests ?? []).map(normRequest); // used by the "Demandeurs" filter
 				[this.dispos, this.rooms] = await Promise.all([fetcher.disponibilities({ from, to }), fetcher.rooms()]);
 			} else {
 				this.agentsList = a.agents ?? []; this.requests = (a.requests ?? []).map(normRequest); this.slots = a.agentSlots ?? []; // the agent's hours, independent of my availabilities
@@ -683,7 +739,7 @@ export class DomHandler {
 		for (const m of this.meetings) if (m.status !== "canceledBy") out.push(mk("meeting", m, agent ? this.who(m.assignationId) : "Rendez-vous", false, m.status));
 		if (agent) {
 			for (const s of this.suggestions) out.push(mk("suggestion", s, "Mes horaires", true));
-			for (const d of this.dispos) if (this.isShown(d.assignationId)) out.push(mk("dispo", d, this.who(d.assignationId)));
+			for (const d of this.dispos) if (this.isVisible(d.assignationId)) out.push(mk("dispo", d, this.who(d.assignationId)));
 		} else {
 			for (const s of this.slots) {
 				const target = s.assignationId;
@@ -739,6 +795,25 @@ export class DomHandler {
 			this.form = {};
 			await this.refreshAgenda();
 		}, "Demande enregistrée. Ajoutez maintenant vos disponibilités dans l’agenda.");
+	}
+
+	/**
+	 * Consumer: change the hours of the current request at any time.
+	 * With `unlimited`, the limit is removed (the request goes back to "sans limite d’heures").
+	 */
+	async updateRequestHours(unlimited = false) {
+		const request = this.currentRequest();
+		if (!request) return;
+		await this.run(async () => {
+			let hours: number | null = null;
+			if (!unlimited) {
+				hours = Number(String(this.form.editHours ?? "").replace(",", "."));
+				if (!(hours > 0)) throw new Error("Indiquez un nombre d’heures supérieur à 0.");
+			}
+			await fetcher.updateRequestHours(request.id, hours);
+			this.form.editHours = "";
+			await this.refreshAgenda();
+		}, unlimited ? "La limite d’heures est retirée." : "Nombre d’heures mis à jour.");
 	}
 
 	closePanel() { this.panel = null; this.cal.selection = null; }
@@ -841,8 +916,22 @@ export class DomHandler {
 			const duration = Number(f.duration);
 			if (Number.isNaN(start.getTime()) || !Number.isInteger(duration) || duration <= 0) throw new Error("Date ou durée invalide.");
 			const ev: CalEvent = p.ev;
-			if (start < ev.start || start.getTime() + duration * 60000 > ev.end.getTime()) {
-				throw new Error(`Le rendez-vous doit rester dans la disponibilité (${this.cal.time(ev.start)} – ${this.cal.time(ev.end)}).`);
+			const end = start.getTime() + duration * 60000;
+			// Treat adjacent availability rows for the same request as one continuous window.
+			const related = this.dispos
+				.filter((d: any) => d.assignationId === f.assignationId && d.requestId === ev.raw.requestId)
+				.map((d: any) => ({ start: Date.parse(d.startAt), end: Date.parse(d.startAt) + d.durationMinutes * 60000 }))
+				.sort((a, b) => a.start - b.start);
+			let coveredUntil = start.getTime();
+			for (const interval of related) {
+				if (interval.end <= coveredUntil) continue;
+				if (interval.start > coveredUntil) break;
+				coveredUntil = Math.max(coveredUntil, interval.end);
+				if (coveredUntil >= end) break;
+			}
+			if (start.getTime() < ev.start.getTime() || coveredUntil < end) {
+				const windowEnd = related.find((interval) => interval.start <= start.getTime() && interval.end >= start.getTime())?.end ?? ev.end.getTime();
+				throw new Error(`Le rendez-vous doit rester dans une disponibilité continue à partir de ${this.cal.time(new Date(start.getTime()))} (disponible jusqu’à ${this.cal.time(new Date(windowEnd))}).`);
 			}
 			await fetcher.createMeeting({
 				assignationId: f.assignationId, startAt: start.toISOString(), durationMinutes: duration,

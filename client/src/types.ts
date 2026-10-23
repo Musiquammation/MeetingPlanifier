@@ -9,10 +9,11 @@ export type Page =
 	| "admin-welcome" | "admin-login" | "admin-signup"
 	| "admin-dashboard" | "admin-companies" | "admin-consumers" | "admin-agents" | "admin-rooms" | "admin-packages" | "admin-results"
 	| "agent-welcome" | "agent-login" | "agent-signup"
-	| "agent-dashboard" | "agent-companies" | "agent-consumers" | "agent-agenda"
+	| "agent-dashboard" | "agent-companies" | "agent-consumers" | "agent-agenda" | "agent-results"
 	| "consumer-welcome" | "consumer-access" | "consumer-dashboard" | "consumer-agenda";
 
-export interface Company { id: Id; name: string }
+/** societyRate (percent) is only sent to administrators: the company takes it on top of the agent's amount (default 28). */
+export interface Company { id: Id; name: string; societyRate?: number }
 
 export interface Room {
 	name: string;
@@ -36,8 +37,14 @@ export interface Meeting {
 	status: "pending" | "done" | "canceledBy";
 	room?: string | null;
 	roomName?: string | null;
-	/** Hourly rate applied to the meeting (from the package resolved when the meeting was created). */
+	/** Hourly rate applied to the meeting (from the package resolved when the meeting was created). Admin only. */
 	hourlyRate?: number;
+	/** Percentage the company takes on the agent (admin only). */
+	societyRate?: number;
+	/** Hourly amount received by the agent (admin and the agent himself). */
+	agentHourlyRate?: number;
+	/** Hourly amount kept by the company (admin only). */
+	societyHourlyRate?: number;
 	comment?: string;
 }
 
@@ -49,6 +56,11 @@ export interface AvailabilityRequest {
 	assignationId: Id;
 	requestedHours: number;
 	scheduledHours?: number;
+	/** Raw values from the server (minutes), used to know the hours that remain. */
+	status?: "open" | "fulfilled" | "closed";
+	requestedMinutes?: number;
+	scheduledMinutes?: number;
+	remainingMinutes?: number;
 }
 
 declare global {

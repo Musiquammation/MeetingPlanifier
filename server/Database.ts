@@ -11,6 +11,11 @@ export type Role = "admin" | "agent" | "consumer";
 export interface Company {
   id: number;
   name: string;
+  /**
+   * Percentage the company takes on top of what the agent receives (default 28).
+   * A price of 32 EUR with a rate of 28 gives 25 EUR to the agent and 7 EUR to the company (32 = 25 * 1.28).
+   */
+  societyRate: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -162,6 +167,12 @@ export interface Meeting {
   roomName: string | null;
   /** Hourly rate applied to this meeting (snapshot of the package resolved at creation). */
   hourlyRate: number;
+  /** Society rate (percent) applied to this meeting; follows the company while the meeting is pending. */
+  societyRate: number;
+  /** Hourly amount received by the agent: hourlyRate / (1 + societyRate / 100). Derived, never stored. */
+  agentHourlyRate: number;
+  /** Hourly amount kept by the company: hourlyRate - agentHourlyRate. Derived, never stored. */
+  societyHourlyRate: number;
   comment: string;
   canceledByRole: Role | null;
   canceledById: number | null;
@@ -253,6 +264,11 @@ const KEY_LENGTH = 6;
 const LOVE_MIN = 0;
 const LOVE_MAX = 1;
 const MAX_INTERVAL_MINUTES = 60 * 24 * 31;
+/** Default percentage taken by the company on the agent (see Company.societyRate). */
+export const DEFAULT_SOCIETY_RATE = 28;
+const MAX_SOCIETY_RATE = 1000;
+/** Two preferences closer than this are considered equal when merging intervals. */
+const LOVE_EPSILON = 1e-9;
 
 /* All schema definitions, SQL statements, and database transactions live in this class. */
 export class Database {
@@ -260,6 +276,7 @@ export class Database {
 CREATE TABLE IF NOT EXISTS companies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK (length(trim(name)) BETWEEN 1 AND 120),
+  society_rate REAL NOT NULL DEFAULT 28 CHECK (society_rate >= 0 AND society_rate <= 1000),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -434,6 +451,7 @@ CREATE TABLE IF NOT EXISTS meetings (
   room_name TEXT,
   comment TEXT NOT NULL DEFAULT '' CHECK (length(comment) <= 4000),
   hourly_rate REAL NOT NULL DEFAULT 0 CHECK (hourly_rate >= 0),
+  society_rate REAL NOT NULL DEFAULT 28 CHECK (society_rate >= 0 AND society_rate <= 1000),
   canceled_by_role TEXT CHECK (canceled_by_role IS NULL OR canceled_by_role IN ('admin', 'agent', 'consumer')),
   canceled_by_id INTEGER,
   idempotency_key TEXT UNIQUE,
@@ -563,6 +581,12 @@ END;
   if (!hasColumn("meetings", "hourly_rate")) {
     this.connection.exec("ALTER TABLE meetings ADD COLUMN hourly_rate REAL NOT NULL DEFAULT 0 CHECK (hourly_rate >= 0)");
   }
+  if (!hasColumn("companies", "society_rate")) {
+    this.connection.exec("ALTER TABLE companies ADD COLUMN society_rate REAL NOT NULL DEFAULT 28 CHECK (society_rate >= 0 AND society_rate <= 1000)");
+  }
+  if (!hasColumn("meetings", "society_rate")) {
+    this.connection.exec("ALTER TABLE meetings ADD COLUMN society_rate REAL NOT NULL DEFAULT 28 CHECK (society_rate >= 0 AND society_rate <= 1000)");
+  }
   if (!hasColumn("rooms", "position")) {
     this.connection.exec("ALTER TABLE rooms ADD COLUMN position INTEGER NOT NULL DEFAULT 0");
     // Keep the previous (alphabetical) order as the initial manual order of every company.
@@ -671,21 +695,21 @@ END;
 
   getCompanyById(id: number): Company | null {
   const row = this.connection.prepare(
-    "SELECT id, name, created_at, updated_at FROM companies WHERE id = ?",
+    "SELECT id, name, society_rate, created_at, updated_at FROM companies WHERE id = ?",
   ).get(id) as RawRow | undefined;
   return row ? this.mapCompany(row) : null;
   }
 
   getCompanyByName(name: string): Company | null {
   const row = this.connection.prepare(
-    "SELECT id, name, created_at, updated_at FROM companies WHERE name = ? COLLATE NOCASE",
+    "SELECT id, name, society_rate, created_at, updated_at FROM companies WHERE name = ? COLLATE NOCASE",
   ).get(name.trim()) as RawRow | undefined;
   return row ? this.mapCompany(row) : null;
   }
 
   listCompanies(): Company[] {
   const rows = this.connection.prepare(
-    "SELECT id, name, created_at, updated_at FROM companies ORDER BY name COLLATE NOCASE",
+    "SELECT id, name, society_rate, created_at, updated_at FROM companies ORDER BY name COLLATE NOCASE",
   ).all() as RawRow[];
   return rows.map((row) => this.mapCompany(row));
   }
@@ -698,6 +722,31 @@ END;
   const company = this.getCompanyById(id);
   if (!company) throw new Error("Company not found");
   return company;
+  }
+
+  /**
+   * Change the percentage the company takes on the agent (0 to 1000).
+   * Pending meetings follow the new rate; done and cancelled meetings keep the rate they were settled with.
+   */
+  updateSocietyRate(companyId: number, societyRate: number): Company {
+  this.assertSocietyRate(societyRate);
+  return this.withTransaction(() => {
+    const now = this.nowIso();
+    this.connection.prepare("UPDATE companies SET society_rate = ?, updated_at = ? WHERE id = ?").run(societyRate, now, companyId);
+    const company = this.getCompanyById(companyId);
+    if (!company) throw new Error("Company not found");
+    this.connection.prepare(
+    `UPDATE meetings SET society_rate = ?, updated_at = ?
+     WHERE status = 'pending'
+     AND assignation_id IN (SELECT a.id FROM assignations a JOIN fidelities f ON f.id = a.fidelity_id WHERE f.company_id = ?)`,
+    ).run(societyRate, now, companyId);
+    return company;
+  });
+  }
+
+  /** Society rate (percent) of a company; falls back to the default when the company is unknown. */
+  getSocietyRate(companyId: number): number {
+  return this.getCompanyById(companyId)?.societyRate ?? DEFAULT_SOCIETY_RATE;
   }
 
   getAdminById(id: number): Admin | null {
@@ -724,7 +773,7 @@ END;
 
   getCompanyForAdmin(adminId: number): Company | null {
   const row = this.connection.prepare(
-    `SELECT c.id, c.name, c.created_at, c.updated_at
+    `SELECT c.id, c.name, c.society_rate, c.created_at, c.updated_at
      FROM companies c JOIN privileges p ON p.company_id = c.id WHERE p.admin_id = ?`,
   ).get(adminId) as RawRow | undefined;
   return row ? this.mapCompany(row) : null;
@@ -1044,8 +1093,8 @@ END;
   const rows = this.connection.prepare(
     `SELECT a.id AS assignation_id, ag.id AS agent_id, ag.name AS agent_name,
         ag.surname AS agent_surname, ag.username AS agent_username, ag.status AS agent_status,
-        c.id AS company_id, c.name AS company_name, c.created_at AS company_created_at,
-        c.updated_at AS company_updated_at
+        c.id AS company_id, c.name AS company_name, c.society_rate AS company_society_rate,
+        c.created_at AS company_created_at, c.updated_at AS company_updated_at
      FROM assignations a
      JOIN agents ag ON ag.id = a.agent_id
      JOIN fidelities f ON f.id = a.fidelity_id
@@ -1060,8 +1109,8 @@ END;
     username: String(row.agent_username), status: String(row.agent_status) as AgentStatus,
     },
     company: this.mapCompany({
-    id: row.company_id, name: row.company_name, created_at: row.company_created_at,
-    updated_at: row.company_updated_at,
+    id: row.company_id, name: row.company_name, society_rate: row.company_society_rate,
+    created_at: row.company_created_at, updated_at: row.company_updated_at,
     }),
   }));
   }
@@ -1450,6 +1499,12 @@ END;
   if (!pack || pack.companyId !== companyId) throw new Error("Package not found for this company");
   }
 
+  private assertSocietyRate(rate: number): void {
+  if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0 || rate > MAX_SOCIETY_RATE) {
+    throw new Error(`Society rate must be a number between 0 and ${MAX_SOCIETY_RATE}`);
+  }
+  }
+
   private assertRate(rate: number): void {
   if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0) throw new Error("Hourly rate must be a number greater than or equal to 0");
   }
@@ -1562,6 +1617,32 @@ END;
   const request = this.getAvailabilityRequest(id);
   if (!request) throw new Error("Availability request not found");
   return request;
+  }
+
+  /**
+   * Change the number of hours of a request whenever the consumer wants (a very large value means "no limit").
+   * The new total can never be below the hours already scheduled; the request is reopened or marked
+   * fulfilled according to the hours that remain. A closed request stays closed.
+   */
+  updateAvailabilityRequestHours(id: number, requestedHours: number): AvailabilityRequestProgress {
+  if (!Number.isFinite(requestedHours) || requestedHours <= 0 || requestedHours > 24 * 366) {
+    throw new Error("Requested hours must be greater than 0 and at most 8784");
+  }
+  const requestedMinutes = Math.round(requestedHours * 60);
+  if (requestedMinutes <= 0) throw new Error("Requested hours must equal at least one minute");
+  return this.withTransaction(() => {
+    const progress = this.getAvailabilityRequestProgress(id);
+    if (!progress) throw new Error("Availability request not found");
+    if (requestedMinutes < progress.scheduledMinutes) {
+    throw new Error(`Requested hours cannot be below the ${Math.round(progress.scheduledMinutes / 6) / 10} h already scheduled`);
+    }
+    const remaining = requestedMinutes - progress.scheduledMinutes;
+    let status: AvailabilityRequestStatus = progress.status;
+    if (status !== "closed") status = remaining > 0 ? "open" : "fulfilled";
+    this.connection.prepare("UPDATE availability_requests SET requested_minutes = ?, status = ?, updated_at = ? WHERE id = ?")
+    .run(requestedMinutes, status, this.nowIso(), id);
+    return this.getAvailabilityRequestProgress(id)!;
+  });
   }
 
   createDisponibility(input: CreateDisponibilityInput): Disponibility {
@@ -1921,7 +2002,24 @@ END;
     throw new Error("Suggestion does not belong to the assigned agent and company");
     }
 
-    this.assertContained(startAt, endAt, String(dispoRow.start_at), Number(dispoRow.duration_minutes), "Disponibility");
+    // A meeting may span adjacent availability rows belonging to the same request.
+    // Walk the sorted intervals to ensure there are no gaps in the requested time range.
+    const availabilityRows = this.connection.prepare(
+      `SELECT start_at, duration_minutes FROM disponibilities
+       WHERE assignation_id = ? AND request_id = ? ORDER BY start_at`,
+    ).all(input.assignationId, input.requestId) as RawRow[];
+    let coveredUntil = Date.parse(startAt);
+    for (const interval of availabilityRows) {
+      const intervalStart = Date.parse(String(interval.start_at));
+      const intervalEnd = intervalStart + Number(interval.duration_minutes) * 60_000;
+      if (intervalEnd <= coveredUntil) continue;
+      if (intervalStart > coveredUntil) break;
+      coveredUntil = Math.max(coveredUntil, intervalEnd);
+      if (coveredUntil >= Date.parse(endAt)) break;
+    }
+    if (coveredUntil < Date.parse(endAt)) {
+      throw new Error("Meeting must fit within continuous consumer availability");
+    }
     this.assertContained(startAt, endAt, String(suggestionRow.start_at), Number(suggestionRow.duration_minutes), "Suggestion");
 
     const progress = this.getAvailabilityRequestProgress(input.requestId);
@@ -1957,12 +2055,12 @@ END;
     `INSERT INTO meetings (
        assignation_id, availability_request_id, source_contract_id,
        source_disponibility_love, source_suggestion_love, start_at, duration_minutes,
-       status, room_company_id, room_name, comment, idempotency_key, hourly_rate, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+       status, room_company_id, room_name, comment, idempotency_key, hourly_rate, society_rate, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
     input.assignationId, input.requestId, Number(suggestionRow.contract_id), Number(dispoRow.love),
     Number(suggestionRow.love), startAt, input.durationMinutes, roomCompanyId, roomName, comment,
-    idempotencyKey, this.resolveHourlyRate(input.assignationId), now, now,
+    idempotencyKey, this.resolveHourlyRate(input.assignationId), this.getSocietyRate(Number(dispoRow.company_id)), now, now,
     );
     const meetingId = Number(insert.lastInsertRowid);
 
@@ -2020,10 +2118,10 @@ END;
     const now = this.nowIso();
     const result = this.connection.prepare(
     `INSERT INTO meetings (assignation_id, start_at, duration_minutes, status, room_company_id,
-      room_name, comment, hourly_rate, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      room_name, comment, hourly_rate, society_rate, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(input.assignationId, startAt, input.durationMinutes, status, roomCompanyId, roomName, comment,
-      this.resolveHourlyRate(input.assignationId), now, now);
+      this.resolveHourlyRate(input.assignationId), this.getSocietyRate(Number(context.company_id)), now, now);
     return this.getMeetingById(Number(result.lastInsertRowid))!;
   });
   }
@@ -2132,11 +2230,13 @@ END;
        AND julianday(start_at, '+' || duration_minutes || ' minutes') > julianday(?) LIMIT 1`,
       ).get(meeting.assignationId, request.id, endAt, meeting.startAt) as RawRow | undefined;
       if (!dispoOverlap) {
-      this.connection.prepare(
+      const restored = this.connection.prepare(
         `INSERT INTO disponibilities (assignation_id, request_id, start_at, duration_minutes, love, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ).run(meeting.assignationId, request.id, meeting.startAt, meeting.durationMinutes,
         meeting.sourceDisponibilityLove, timestamp, timestamp);
+      // The freed slot may touch availabilities of the same preference: they become one single availability.
+      this.mergeTouchingIntervals("disponibilities", Number(restored.lastInsertRowid));
       }
       const suggestionOverlap = this.connection.prepare(
       `SELECT s.id FROM suggestions s JOIN contracts c ON c.id = s.contract_id
@@ -2145,11 +2245,13 @@ END;
          AND julianday(s.start_at, '+' || s.duration_minutes || ' minutes') > julianday(?) LIMIT 1`,
       ).get(meeting.sourceContractId, endAt, meeting.startAt) as RawRow | undefined;
       if (!suggestionOverlap) {
-      this.connection.prepare(
+      const restored = this.connection.prepare(
         `INSERT INTO suggestions (contract_id, start_at, duration_minutes, love, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
       ).run(meeting.sourceContractId, meeting.startAt, meeting.durationMinutes,
         meeting.sourceSuggestionLove, timestamp, timestamp);
+      // Same for the agent's opening hours.
+      this.mergeTouchingIntervals("suggestions", Number(restored.lastInsertRowid));
       }
       const progress = this.getAvailabilityRequestProgress(request.id)!;
       if (progress.remainingMinutes > 0 && request.status === "fulfilled") {
@@ -2322,6 +2424,50 @@ END;
   }
   }
 
+  /**
+   * Merge an interval with the intervals of the same owner that touch it (end = start) and have the same preference.
+   * The interval with the given id absorbs them (before and after, repeatedly), so a restored slot sitting between
+   * two slots of equal preference gives back a single long interval. Intervals of another preference are never touched,
+   * and a merge that would exceed the maximum interval length is skipped.
+   * Owner of a disponibility = same assignation and same request; owner of a suggestion = same contract.
+   */
+  private mergeTouchingIntervals(table: "disponibilities" | "suggestions", id: number): void {
+  const ownerColumns = table === "disponibilities" ? ["assignation_id", "request_id"] : ["contract_id"];
+  const current = this.connection.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id) as RawRow | undefined;
+  if (!current) return;
+  const owner = ownerColumns.map((column) => current[column]);
+  // Normalize missing SQLite values to NULL before binding; node:sqlite does not accept undefined.
+   const siblings = this.connection.prepare(
+    `SELECT * FROM ${table} WHERE ${ownerColumns.map((column) => `${column} = ?`).join(" AND ")} AND id <> ?`,
+  ).all(...owner.map((value) => value ?? null), id) as RawRow[];
+  const love = Number(current.love);
+  let start = Date.parse(String(current.start_at));
+  let end = start + Number(current.duration_minutes) * 60_000;
+  const absorbed = new Set<number>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const sibling of siblings) {
+    const siblingId = Number(sibling.id);
+    if (absorbed.has(siblingId) || Math.abs(Number(sibling.love) - love) > LOVE_EPSILON) continue;
+    const siblingStart = Date.parse(String(sibling.start_at));
+    const siblingEnd = siblingStart + Number(sibling.duration_minutes) * 60_000;
+    if (siblingEnd !== start && siblingStart !== end) continue; // not touching
+    const mergedStart = Math.min(start, siblingStart);
+    const mergedEnd = Math.max(end, siblingEnd);
+    if ((mergedEnd - mergedStart) / 60_000 > MAX_INTERVAL_MINUTES) continue;
+    start = mergedStart; end = mergedEnd;
+    absorbed.add(siblingId);
+    changed = true;
+    }
+  }
+  if (!absorbed.size) return;
+  const remove = this.connection.prepare(`DELETE FROM ${table} WHERE id = ?`);
+  for (const siblingId of absorbed) remove.run(siblingId);
+  this.connection.prepare(`UPDATE ${table} SET start_at = ?, duration_minutes = ?, updated_at = ? WHERE id = ?`)
+    .run(new Date(start).toISOString(), Math.round((end - start) / 60_000), this.nowIso(), id);
+  }
+
   private trimInterval(table: "disponibilities" | "suggestions", id: number, oldStart: string, oldDuration: number, now: string): void {
   const oldEndMs = Date.parse(oldStart) + oldDuration * 60_000;
   const nowMs = Date.parse(now);
@@ -2360,7 +2506,9 @@ END;
 
   private mapCompany(row: RawRow): Company {
   return {
-    id: Number(row.id), name: String(row.name), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+    id: Number(row.id), name: String(row.name),
+    societyRate: row.society_rate === null || row.society_rate === undefined ? DEFAULT_SOCIETY_RATE : Number(row.society_rate),
+    createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
   }
 
@@ -2455,6 +2603,10 @@ END;
   }
 
   private mapMeeting(row: RawRow): Meeting {
+  const hourlyRate = Number(row.hourly_rate ?? 0);
+  const societyRate = row.society_rate === null || row.society_rate === undefined ? DEFAULT_SOCIETY_RATE : Number(row.society_rate);
+  // The price already includes the company's share: price = agent amount * (1 + rate / 100).
+  const agentHourlyRate = hourlyRate / (1 + societyRate / 100);
   return {
     id: Number(row.id), assignationId: Number(row.assignation_id),
     availabilityRequestId: row.availability_request_id === null || row.availability_request_id === undefined ? null : Number(row.availability_request_id),
@@ -2464,7 +2616,10 @@ END;
     startAt: String(row.start_at), durationMinutes: Number(row.duration_minutes), status: String(row.status) as MeetingStatus,
     roomCompanyId: row.room_company_id === null || row.room_company_id === undefined ? null : Number(row.room_company_id),
     roomName: row.room_name === null || row.room_name === undefined ? null : String(row.room_name),
-    hourlyRate: Number(row.hourly_rate ?? 0),
+    hourlyRate,
+    societyRate,
+    agentHourlyRate,
+    societyHourlyRate: hourlyRate - agentHourlyRate,
     comment: String(row.comment ?? ""),
     canceledByRole: row.canceled_by_role === null || row.canceled_by_role === undefined ? null : String(row.canceled_by_role) as Role,
     canceledById: row.canceled_by_id === null || row.canceled_by_id === undefined ? null : Number(row.canceled_by_id),

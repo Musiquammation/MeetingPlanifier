@@ -31,6 +31,25 @@ function optionalId(value: unknown, label: string): number | null {
   if (value === undefined || value === null || value === "") return null;
   return positiveInt(value, label);
 }
+/**
+ * Money visible to each role. The price already contains the company's share (price = agent amount x (1 + rate / 100)):
+ *  - admin: everything (price, society rate, agent amount, company amount);
+ *  - agent: only his own amount (agentHourlyRate);
+ *  - consumer: no amount about the split.
+ */
+function meetingForRole(meeting: any, role: Role): any {
+  if (!meeting || role === "admin") return meeting;
+  const { hourlyRate: _price, societyRate: _rate, societyHourlyRate: _society, ...agentView } = meeting;
+  if (role === "agent") return agentView;
+  const { agentHourlyRate: _agentAmount, ...consumerView } = agentView;
+  return consumerView;
+}
+/** The society rate is only for administrators. */
+function companyForRole(company: any, role: Role): any {
+  if (!company || role === "admin") return company;
+  const { societyRate: _rate, ...rest } = company;
+  return rest;
+}
 function intervalInput(body: any) {
   const startAt = requiredString(body.startAt ?? body.start_at, "startAt", 40);
   const durationMinutes = positiveInt(body.durationMinutes ?? body.duration_minutes, "durationMinutes");
@@ -152,9 +171,20 @@ export function initApi(app: Express, database: Db): void {
 	try {
 	  const s = session(req);
 	  if (s.role === "admin") return res.json([database.getCompanyForAdmin(s.id)].filter(Boolean));
-	  if (s.role === "agent") return res.json(database.listContractsForAgent(s.id).map((c: any) => database.getCompanyById(c.companyId ?? c.company_id)).filter(Boolean));
-	  return res.json(database.listAssignedAgentsForConsumer(s.id).map((x: any) => x.company).filter(Boolean));
+	  if (s.role === "agent") return res.json(database.listContractsForAgent(s.id).map((c: any) => companyForRole(database.getCompanyById(c.companyId ?? c.company_id), s.role)).filter(Boolean));
+	  return res.json(database.listAssignedAgentsForConsumer(s.id).map((x: any) => companyForRole(x.company, s.role)).filter(Boolean));
 	} catch (e: any) { return fail(res, 400, e.message); }
+  });
+
+  /** Sets the society rate: the percentage the company takes on the agent (default 28). Pending meetings follow it. */
+  app.patch("/api/companies/current", admin, (req, res) => {
+	try {
+	  const rate = Number(req.body.societyRate);
+	  if (req.body.societyRate === undefined || req.body.societyRate === null || req.body.societyRate === "" || !Number.isFinite(rate) || rate < 0 || rate > 1000) {
+		return fail(res, 400, "Le taux de la société doit être un nombre entre 0 et 1000 (en pourcentage).");
+	  }
+	  return res.json(database.updateSocietyRate(companyId(req), rate));
+	} catch (e: any) { return fail(res, 400, e.message || "Modification impossible."); }
   });
 
   app.get("/api/consumers/search", admin, (req, res) => {
@@ -374,12 +404,12 @@ export function initApi(app: Express, database: Db): void {
 		const agents = database.listAssignedAgentsForConsumer(s.id);
 		const assignations = database.listAssignationsForConsumer(s.id);
 		return res.json({
-		  agents,
+		  agents: agents.map((x: any) => ({ ...x, company: companyForRole(x.company, s.role) })),
 		  requests: assignations.flatMap((a: any) => database.listAvailabilityRequestsForAssignation(a.id)),
 		  slots: database.listCompatibleSlotsForConsumer(s.id, from, to),
 		  // The agent's opening hours, whatever the consumer's own availabilities are
 		  agentSlots: database.listAgentSuggestionsForConsumer(s.id, from, to),
-		  meetings: assignations.flatMap((a: any) => database.listMeetingsForAssignation(a.id, from, to))
+		  meetings: assignations.flatMap((a: any) => database.listMeetingsForAssignation(a.id, from, to)).map((m: any) => meetingForRole(m, s.role))
 		});
 	  }
 	  if (s.role === "agent") {
@@ -388,7 +418,9 @@ export function initApi(app: Express, database: Db): void {
 		return res.json({
 		  contracts, assignations,
 		  suggestions: contracts.flatMap((c: any) => database.listSuggestionsForContract(c.id, from, to)),
-		  meetings: assignations.flatMap((a: any) => database.listMeetingsForAssignation(a.id, from, to))
+		  // Requests of the agent's consumers (with the hours still to schedule): used to find who is asking for hours.
+		  requests: assignations.flatMap((a: any) => database.listAvailabilityRequestsForAssignation(a.id)),
+		  meetings: assignations.flatMap((a: any) => database.listMeetingsForAssignation(a.id, from, to)).map((m: any) => meetingForRole(m, s.role))
 		});
 	  }
 	  return res.json({ meetings: database.listMeetingsForCompany(companyId(req), from, to), agents: database.listAgentsForCompany(companyId(req)) });
@@ -404,6 +436,29 @@ export function initApi(app: Express, database: Db): void {
 	  if (!owned) return fail(res, 403, "Assignation inaccessible.");
 	  return res.status(201).json(database.createAvailabilityRequest(assignationId, hours));
 	} catch (e: any) { return fail(res, 400, e.message); }
+  });
+  /**
+   * Changes the hours of a request at any time. requestedHours null / "" removes the limit (back to "unlimited").
+   * The new total cannot be below the hours already scheduled.
+   */
+  app.patch("/api/availability-requests/:id", auth(["consumer"]), (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  const request = database.getAvailabilityRequest(id);
+	  const owned = request && database.listAssignationsForConsumer(session(req).id).some((a: any) => a.id === request.assignationId);
+	  if (!owned) return fail(res, 404, "Demande introuvable.");
+	  const raw = req.body.requestedHours;
+	  let hours = UNLIMITED_HOURS;
+	  if (raw !== undefined && raw !== null && raw !== "") {
+		hours = Number(raw);
+		if (!Number.isFinite(hours) || hours <= 0 || hours > UNLIMITED_HOURS) return fail(res, 400, "requestedHours doit être supérieur à 0.");
+	  }
+	  return res.json(database.updateAvailabilityRequestHours(id, hours));
+	} catch (e: any) {
+	  const m = String(e.message || "");
+	  const below = /already scheduled/.test(m) ? m.match(/the ([\d.]+) h already/) : null;
+	  return fail(res, 400, below ? `Vous avez déjà ${below[1]} h planifiées : indiquez au moins ce nombre d’heures, ou retirez la limite.` : m || "Modification impossible.");
+	}
   });
   app.get("/api/disponibilities", auth(), (req, res) => {
 	try {
@@ -492,6 +547,7 @@ export function initApi(app: Express, database: Db): void {
 	} catch (e: any) { return fail(res, 400, e.message); }
   });
 
+	
 	app.post("/api/meetings/from-availability", auth(["agent"]), (req, res) => {
 		try {
 			const assignationId = positiveInt(req.body.assignationId, "assignationId");
@@ -508,23 +564,165 @@ export function initApi(app: Express, database: Db): void {
 				return fail(res, 400, "Date de début invalide.");
 			}
 
-			const owned = database.listAssignationsForAgent(session(req).id)
+			const agentId = session(req).id;
+
+			const owned = database
+				.listAssignationsForAgent(agentId)
 				.some((a: any) => a.id === assignationId);
 
-			if (!owned) return fail(res, 403, "Assignation inaccessible.");
+			if (!owned) {
+				return fail(res, 403, "Assignation inaccessible.");
+			}
 
-
-			// Locate the consumer availability and the agent suggestion that contain the requested interval.
 			const t0 = Date.parse(startAt);
 			const t1 = t0 + durationMinutes * 60000;
-			const within = (x: any) => Date.parse(x.startAt) <= t0 && Date.parse(x.startAt) + x.durationMinutes * 60000 >= t1;
+
+			// Check whether consecutive intervals cover the complete requested range.
+			const coversRange = (
+				items: any[],
+				start: number,
+				end: number
+			): boolean => {
+				let coveredUntil = start;
+
+				const sortedItems = items
+					.slice()
+					.sort(
+						(a: any, b: any) =>
+							Date.parse(a.startAt) - Date.parse(b.startAt)
+					);
+
+				for (const item of sortedItems) {
+					const itemStart = Date.parse(item.startAt);
+					const itemEnd =
+						itemStart + Number(item.durationMinutes) * 60000;
+
+					// Ignore invalid intervals.
+					if (
+						!Number.isFinite(itemStart) ||
+						!Number.isFinite(itemEnd) ||
+						itemEnd <= itemStart
+					) {
+						continue;
+					}
+
+					// This interval does not extend the covered range.
+					if (itemEnd <= coveredUntil) {
+						continue;
+					}
+
+					// A gap means the requested range is not fully covered.
+					if (itemStart > coveredUntil) {
+						break;
+					}
+
+					coveredUntil = Math.max(coveredUntil, itemEnd);
+
+					if (coveredUntil >= end) {
+						return true;
+					}
+				}
+
+				return false;
+			};
+
 			const assignation = database.getAssignationById(assignationId);
-			const fidelity = assignation ? database.getFidelityById(assignation.fidelityId) : null;
-			const dispo = database.listDisponibilitiesForAssignation(assignationId).find(within);
-			if (!assignation || !fidelity || !dispo) return fail(res, 409, "Ce créneau n'est plus dans une disponibilité du consommateur.");
-			const contract = database.listContractsForAgent(session(req).id).find((c: any) => c.companyId === fidelity.companyId);
-			const suggestion = contract ? database.listSuggestionsForContract(contract.id).find(within) : undefined;
-			if (!suggestion) return fail(res, 409, "Ce créneau n'est pas dans vos horaires.");
+			const fidelity = assignation
+				? database.getFidelityById(assignation.fidelityId)
+				: null;
+
+			if (!assignation || !fidelity) {
+				return fail(res, 409, "Assignation ou contrat introuvable.");
+			}
+
+			// Find the consumer availability interval containing the start time.
+			const disponibilities =
+				database.listDisponibilitiesForAssignation(assignationId);
+
+			const dispo = disponibilities.find((item: any) => {
+				const itemStart = Date.parse(item.startAt);
+				const itemEnd =
+					itemStart + Number(item.durationMinutes) * 60000;
+
+				return itemStart <= t0 && itemEnd > t0;
+			});
+
+			if (!dispo) {
+				return fail(
+					res,
+					409,
+					"Le début du créneau ne correspond à aucune disponibilité du consommateur."
+				);
+			}
+
+			// Consumer availability must cover the entire meeting within one request.
+			const consumerIntervals = disponibilities.filter(
+				(item: any) => item.requestId === dispo.requestId
+			);
+
+			const availabilityCovered = coversRange(
+				consumerIntervals,
+				t0,
+				t1
+			);
+
+			if (!availabilityCovered) {
+				return fail(
+					res,
+					409,
+					"Ce créneau n'est pas couvert par des disponibilités continues du consommateur."
+				);
+			}
+
+			// Find the agent contract for the consumer's company.
+			const contract = database
+				.listContractsForAgent(agentId)
+				.find(
+					(item: any) => item.companyId === fidelity.companyId
+				);
+
+			if (!contract) {
+				return fail(
+					res,
+					409,
+					"Aucun contrat ne correspond à cette entreprise."
+				);
+			}
+
+			const suggestions =
+				database.listSuggestionsForContract(contract.id);
+
+			// Find the agent suggestion containing the requested start time.
+			const suggestion = suggestions.find((item: any) => {
+				const itemStart = Date.parse(item.startAt);
+				const itemEnd =
+					itemStart + Number(item.durationMinutes) * 60000;
+
+				return itemStart <= t0 && itemEnd > t0;
+			});
+
+			if (!suggestion) {
+				return fail(
+					res,
+					409,
+					"Le début du créneau ne correspond à aucun de vos horaires."
+				);
+			}
+
+			// Consecutive suggestions must cover the entire meeting.
+			const suggestionsCovered = coversRange(
+				suggestions,
+				t0,
+				t1
+			);
+
+			if (!suggestionsCovered) {
+				return fail(
+					res,
+					409,
+					"Ce créneau n'est pas couvert par des horaires continus de l'agent."
+				);
+			}
 
 			const result = database.createMeetingFromAvailability({
 				assignationId,
@@ -533,22 +731,36 @@ export function initApi(app: Express, database: Db): void {
 				suggestionId: suggestion.id,
 				startAt,
 				durationMinutes,
-				roomName: req.body.roomName == null || req.body.roomName === ""
-					? null
-					: requiredString(req.body.roomName, "roomName", 100),
-				comment: typeof req.body.comment === "string"
-					? req.body.comment.slice(0, 2000)
-					: "",
-				idempotencyKey: typeof req.body.idempotencyKey === "string"
-					? req.body.idempotencyKey.slice(0, 100)
-					: undefined
+				roomName:
+					req.body.roomName == null || req.body.roomName === ""
+						? null
+						: requiredString(req.body.roomName, "roomName", 100),
+				comment:
+					typeof req.body.comment === "string"
+						? req.body.comment.slice(0, 2000)
+						: "",
+				idempotencyKey:
+					typeof req.body.idempotencyKey === "string"
+						? req.body.idempotencyKey.slice(0, 100)
+						: undefined
 			});
 
-			return res.status(201).json(result);
+			return res.status(201).json({
+				...result,
+				meeting: meetingForRole(
+					result.meeting,
+					session(req).role
+				)
+			});
 		} catch (e: any) {
-			return fail(res, 409, e.message || "Créneau non réservable.");
+			return fail(
+				res,
+				409,
+				e.message || "Créneau non réservable."
+			);
 		}
 	});
+
 	
   app.patch("/api/meetings/:id", auth(["agent", "admin"]), (req, res) => {
 	try {
@@ -561,7 +773,7 @@ export function initApi(app: Express, database: Db): void {
 	  if (req.body.roomName !== undefined) meeting = database.setMeetingRoom(id, req.body.roomName === null || req.body.roomName === "" ? null : requiredString(req.body.roomName, "roomName", 100));
 	  if (req.body.status === "done") meeting = database.markMeetingDone(id);
 	  else if (req.body.status !== undefined) return fail(res, 400, "Statut non autorisé.");
-	  return res.json(meeting);
+	  return res.json(meetingForRole(meeting, s.role));
 	} catch (e: any) { return fail(res, 400, e.message); }
   });
   app.post("/api/meetings/:id/cancel", auth(["agent", "admin", "consumer"]), (req, res) => {
@@ -572,7 +784,7 @@ export function initApi(app: Express, database: Db): void {
 	  const s = session(req);
 	  if (s.role === "agent" && !database.listAssignationsForAgent(s.id).some((a: any) => a.id === (meeting.assignationId ?? meeting.assignation_id))) return fail(res, 403, "Réunion inaccessible.");
 	  if (s.role === "consumer" && !database.listAssignationsForConsumer(s.id).some((a: any) => a.id === (meeting.assignationId ?? meeting.assignation_id))) return fail(res, 403, "Réunion inaccessible.");
-	  return res.json(database.cancelMeeting(id, s.role, s.id));
+	  return res.json(meetingForRole(database.cancelMeeting(id, s.role, s.id), s.role));
 	} catch (e: any) { return fail(res, 400, e.message); }
   });
 }

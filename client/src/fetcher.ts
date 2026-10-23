@@ -86,6 +86,8 @@ export class Fetcher {
 
 	// ---- Administration -------------------------------------------------
 	companies() { return this.get<any[]>("/api/companies"); }
+	/** Percentage the company takes on the agent (default 28): 32 EUR paid = 25 EUR for the agent + 7 EUR for the company. */
+	updateSocietyRate(societyRate: number) { return this.patch("/api/companies/current", { societyRate }); }
 	consumers() { return this.get<any[]>("/api/consumers"); }
 	searchConsumers(q: string) { return this.get<any[]>("/api/consumers/search", { q, limit: 20 }); }
 	createConsumer(b: { name: string; surname: string; username: string; password?: string }) { return this.post("/api/consumers", b); }
@@ -127,6 +129,8 @@ export class Fetcher {
 	// ---- Agenda ---------------------------------------------------------
 	agenda(from: string, to: string) { return this.get("/api/agenda", { from, to }); }
 	createRequest(assignationId: number, requestedHours: number) { return this.post("/api/availability-requests", { assignationId, requestedHours }); }
+	/** Changes the hours of a request at any time; null removes the limit. */
+	updateRequestHours(id: number, requestedHours: number | null) { return this.patch(`/api/availability-requests/${id}`, { requestedHours }); }
 
 	disponibilities(q: { assignationId?: number; from?: string; to?: string }) { return this.get<any[]>("/api/disponibilities", q); }
 	createDispo(b: { assignationId: number; requestId?: number; startAt: string; durationMinutes: number; love: number }) { return this.post("/api/disponibilities", b); }
