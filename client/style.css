@@ -317,8 +317,10 @@ button[aria-pressed="true"] { background: var(--pine); color: var(--pine-ink); b
 	height: calc(var(--hours) * var(--hour));
 	border-left: 1px solid var(--line);
 	background-image: repeating-linear-gradient(to bottom, var(--line) 0, var(--line) 1px, transparent 1px, transparent var(--hour));
-	touch-action: pan-y;
+	touch-action: pan-y; /* a finger scrolls; holding it still opens a slot (see Calendar.down) */
 	user-select: none;
+	-webkit-user-select: none;
+	-webkit-touch-callout: none;
 	cursor: cell;
 }
 
@@ -534,79 +536,43 @@ aside[role="dialog"] dd { margin: 0; }
 tr[data-sub] td { background: var(--amber-bg); }
 
 
-/* Consumer availability filters */
+/* Consumer availability filters (agent agenda): two rows of chips, see [data-chip] */
 fieldset[data-consumers] {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(min(17rem, 100%), 1fr));
-	align-items: start;
-	gap: 0.5rem 1rem;
-
+	display: block;
 	min-width: 0;
 	margin: 0 0 1rem;
-	padding: 0.75rem 1rem 1rem;
-
+	padding: 0.5rem 0.75rem 0.75rem;
 	border: 1px solid var(--line);
 	border-radius: var(--radius);
 	background: var(--surface);
 }
 
 fieldset[data-consumers] legend {
-	padding: 0 0.5rem;
-	font-weight: 600;
-	font-size: 0.9rem;
-	color: var(--muted);
-}
-
-fieldset[data-consumers] label {
-	display: flex;
-	align-items: flex-start;
-	gap: 0.6rem;
-
-	min-width: 0;
-	margin: 0;
-	padding: 0.5rem 0.6rem;
-
-	font-weight: 400;
-	line-height: 1.4;
-	border-radius: 0.4rem;
-	cursor: pointer;
-	overflow-wrap: anywhere;
-}
-
-fieldset[data-consumers] label:hover {
-	background: color-mix(in srgb, var(--pine) 7%, transparent);
-}
-
-fieldset[data-consumers] input[type="checkbox"] {
-	flex: 0 0 1.1rem;
-	width: 1.1rem;
-	height: 1.1rem;
-	min-height: 1.1rem;
-	margin: 0.15rem 0 0;
-	accent-color: var(--pine);
-}
-
-fieldset[data-consumers] label small {
-	color: var(--muted);
+	padding: 0 0.4rem;
 	font-size: 0.8rem;
-	font-weight: 400;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--muted);
 }
 
-fieldset[data-consumers] label b {
-	font-weight: 600;
+fieldset[data-consumers] [data-row] {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.4rem;
 }
 
-@media (max-width: 600px) {
-	fieldset[data-consumers] {
-		grid-template-columns: minmax(0, 1fr);
-		padding-inline: 0.5rem;
-		gap: 0.25rem;
-	}
-
-	fieldset[data-consumers] label {
-		padding: 0.6rem 0.5rem;
-	}
+fieldset[data-consumers] [data-row] + [data-row] {
+	margin-top: 0.5rem;
+	padding-top: 0.5rem;
+	border-top: 1px solid var(--line);
 }
+
+fieldset[data-consumers] [data-chip] { min-width: 0; overflow-wrap: anywhere; }
+fieldset[data-consumers] [data-chip] small { font-weight: 400; }
+fieldset[data-consumers] [data-chip]:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
+fieldset[data-consumers] p { margin: 0; }
 
 [data-cancelled] { margin-top: 1.25rem; }
 [data-cancelled] ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.4rem; }
@@ -618,7 +584,8 @@ fieldset[data-consumers] label b {
 	cursor: pointer;
 	user-select: none;
 	-webkit-user-select: none;
-	touch-action: none;
+	-webkit-touch-callout: none;
+	touch-action: pan-y;
 	-webkit-user-drag: none;
 }
 
@@ -632,6 +599,8 @@ fieldset[data-consumers] label b {
 /* ---- Admin: rooms, packages and results ---------------------------------- */
 
 td select { min-width: 10rem; }
+button[data-copy] { white-space: nowrap; }
+button[data-copy] code { font-weight: 700; letter-spacing: 0.08em; }
 tfoot th { color: var(--ink); font-size: 1rem; }
 [data-month] { text-transform: capitalize; }
 

@@ -644,7 +644,12 @@ export function initApi(app: Express, database: Db): void {
 				const itemEnd =
 					itemStart + Number(item.durationMinutes) * 60000;
 
-				return itemStart <= t0 && itemEnd > t0;
+				// Several requests can overlap: keep the one whose intervals cover the whole meeting.
+				return itemStart <= t0 && itemEnd > t0
+					&& coversRange(disponibilities.filter((d: any) => d.requestId === item.requestId), t0, t1);
+			}) ?? disponibilities.find((item: any) => {
+				const itemStart = Date.parse(item.startAt);
+				return itemStart <= t0 && itemStart + Number(item.durationMinutes) * 60000 > t0;
 			});
 
 			if (!dispo) {

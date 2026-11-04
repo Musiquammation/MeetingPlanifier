@@ -159,7 +159,10 @@ export class DomHandler {
 	}
 
 	async route(): Promise<void> {
-		const raw = decodeURIComponent(location.hash.replace(/^#\/?/, "")).split("?")[0];
+		const [raw, query = ""] = location.hash.replace(/^#\/?/, "").split("?", 2);
+		// Access link sent by the admin: #consumer-welcome?key=ABCDEF logs the consumer in directly.
+		const accessKey = raw === "consumer-welcome" ? (new URLSearchParams(query).get("key") ?? "").trim() : "";
+		if (accessKey) return this.accessWithKey(accessKey);
 		let page = (Object.prototype.hasOwnProperty.call(PAGES, raw) ? raw : "main") as Page;
 		const need = PAGES[page];
 		if (need && this.role !== need) page = `${need}-welcome` as Page; // private page without matching session
@@ -172,6 +175,23 @@ export class DomHandler {
 		this.ready = true;
 		window.scrollTo(0, 0);
 		await this.loadPage();
+	}
+
+	/** Opens the consumer space with the key of an access link; on failure the access form is shown, prefilled. */
+	private async accessWithKey(key: string): Promise<void> {
+		history.replaceState(null, "", "#consumer-access"); // the key does not stay in the address bar
+		if (this.role) { // the link wins over the session already open in this browser
+			try { await fetcher.logout(); } catch { /* the token is dropped locally anyway */ }
+			this.clearSession();
+		}
+		try {
+			this.startSession("consumer", await fetcher.consumerAccess(key));
+			this.go(HOME.consumer);
+		} catch (e: any) {
+			this.flash = e?.message ?? "Clé d’accès invalide.";
+			await this.route();
+			this.form.key = key;
+		}
 	}
 
 	// ---- Helpers for submits and loads -----------------------------------
@@ -305,6 +325,22 @@ export class DomHandler {
 	inCompany(a: any): boolean { return this.agents.some((x) => x.id === a.id); }
 	fidelityId(c: any): number { return c.fidelityId ?? c.fidelity?.id; }
 	fidelityKey(c: any): string { return c.fidelityKey ?? c.fidelity?.key ?? "—"; }
+	copyConsumerLink(c: any): void {
+		const key = this.fidelityKey(c);
+		if (!key || key === "—") { this.error = "Aucune clé d’accès disponible pour ce consommateur."; return; }
+		const link = `${location.origin}${location.pathname}#consumer-welcome?key=${encodeURIComponent(key)}`;
+		const done = () => { this.notice = `Lien d’accès de ${this.consumerLabel(c)} copié : ${link}`; this.error = ""; };
+		const fallback = () => { // navigator.clipboard only exists on https or localhost
+			const area = document.createElement("textarea");
+			area.value = link;
+			document.body.append(area);
+			area.select();
+			const ok = document.execCommand("copy");
+			area.remove();
+			if (ok) done(); else { this.notice = ""; this.error = `Copie impossible, copiez le lien à la main : ${link}`; }
+		};
+		if (navigator.clipboard) navigator.clipboard.writeText(link).then(done, fallback); else fallback();
+	}
 	/** An implicit request (hours not stated by the consumer) is created with this many hours. */
 	isUnlimited(r: AvailabilityRequest): boolean { return r.requestedHours >= 1000; }
 	progress(r: AvailabilityRequest): string {
@@ -889,11 +925,14 @@ export class DomHandler {
 	}
 
 	// ---- Agent: book a meeting inside a consumer availability ---------------
+	/** The meeting starts at the clicked quarter hour (or at the start of the availability when clicked elsewhere). */
 	private async openBook(ev: CalEvent) {
-		const minutes = Math.round((ev.end.getTime() - ev.start.getTime()) / 60000);
+		const at = this.cal.lastPoint?.getTime() ?? 0;
+		const start = at >= ev.start.getTime() && at < ev.end.getTime() ? new Date(at) : ev.start;
+		const minutes = Math.round((ev.end.getTime() - start.getTime()) / 60000);
 		this.panel = {
 			type: "book", ev, error: "", key: uid(), rooms: [] as Room[],
-			form: { assignationId: ev.raw.assignationId, start: toLocalInput(ev.start), duration: Math.min(60, minutes), roomName: "", comment: "" }
+			form: { assignationId: ev.raw.assignationId, start: toLocalInput(start), duration: Math.min(60, minutes), roomName: "", comment: "" }
 		};
 		await this.checkRooms();
 	}
@@ -929,7 +968,7 @@ export class DomHandler {
 				coveredUntil = Math.max(coveredUntil, interval.end);
 				if (coveredUntil >= end) break;
 			}
-			if (start.getTime() < ev.start.getTime() || coveredUntil < end) {
+			if (coveredUntil < end) {
 				const windowEnd = related.find((interval) => interval.start <= start.getTime() && interval.end >= start.getTime())?.end ?? ev.end.getTime();
 				throw new Error(`Le rendez-vous doit rester dans une disponibilité continue à partir de ${this.cal.time(new Date(start.getTime()))} (disponible jusqu’à ${this.cal.time(new Date(windowEnd))}).`);
 			}

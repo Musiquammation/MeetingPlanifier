@@ -1991,7 +1991,9 @@ END;
      WHERE d.id = ? AND d.request_id = ? AND d.assignation_id = ? AND f.active = 1`,
     ).get(input.disponibilityId, input.requestId, input.assignationId) as RawRow | undefined;
     if (!dispoRow) throw new Error("Disponibility is no longer available for this request");
-    if (String(dispoRow.request_status) !== "open") throw new Error("Availability request is not open");
+    // The stored status can lag behind (hours changed, meeting cancelled...): only a closed request refuses meetings,
+    // the remaining hours are checked below from the real progress.
+    if (String(dispoRow.request_status) === "closed") throw new Error("Availability request is closed");
 
     const suggestionRow = this.connection.prepare(
     `SELECT s.*, c.agent_id, c.company_id
@@ -2005,22 +2007,19 @@ END;
     // A meeting may span adjacent availability rows belonging to the same request.
     // Walk the sorted intervals to ensure there are no gaps in the requested time range.
     const availabilityRows = this.connection.prepare(
-      `SELECT start_at, duration_minutes FROM disponibilities
+      `SELECT * FROM disponibilities
        WHERE assignation_id = ? AND request_id = ? ORDER BY start_at`,
     ).all(input.assignationId, input.requestId) as RawRow[];
-    let coveredUntil = Date.parse(startAt);
-    for (const interval of availabilityRows) {
-      const intervalStart = Date.parse(String(interval.start_at));
-      const intervalEnd = intervalStart + Number(interval.duration_minutes) * 60_000;
-      if (intervalEnd <= coveredUntil) continue;
-      if (intervalStart > coveredUntil) break;
-      coveredUntil = Math.max(coveredUntil, intervalEnd);
-      if (coveredUntil >= Date.parse(endAt)) break;
-    }
-    if (coveredUntil < Date.parse(endAt)) {
+    if (!this.rowsCover(availabilityRows, startAt, endAt)) {
       throw new Error("Meeting must fit within continuous consumer availability");
     }
-    this.assertContained(startAt, endAt, String(suggestionRow.start_at), Number(suggestionRow.duration_minutes), "Suggestion");
+    // Same for the agent: adjacent suggestions (e.g. of different preferences) can jointly cover the meeting.
+    const suggestionRows = this.connection.prepare(
+      "SELECT * FROM suggestions WHERE contract_id = ? ORDER BY start_at",
+    ).all(Number(suggestionRow.contract_id)) as RawRow[];
+    if (!this.rowsCover(suggestionRows, startAt, endAt)) {
+      throw new Error("Selected interval is outside the available suggestion");
+    }
 
     const progress = this.getAvailabilityRequestProgress(input.requestId);
     if (!progress || progress.remainingMinutes < input.durationMinutes) {
@@ -2064,13 +2063,16 @@ END;
     );
     const meetingId = Number(insert.lastInsertRowid);
 
-    this.splitDisponibility(this.mapDisponibility(dispoRow), startAt, input.durationMinutes);
-    this.splitSuggestion(this.mapSuggestion(suggestionRow), startAt, input.durationMinutes);
-    const progressAfter = this.getAvailabilityRequestProgress(input.requestId)!;
-    if (progressAfter.remainingMinutes <= 0) {
-    this.connection.prepare("UPDATE availability_requests SET status = 'fulfilled', updated_at = ? WHERE id = ?")
-      .run(now, input.requestId);
+    // Consume the booked range from every interval it intersects (adjacent rows can jointly cover a meeting).
+    for (const part of this.intersections(availabilityRows, startAt, endAt)) {
+      this.splitDisponibility(this.mapDisponibility(part.row), part.start, part.minutes);
     }
+    for (const part of this.intersections(suggestionRows, startAt, endAt)) {
+      this.splitSuggestion(this.mapSuggestion(part.row), part.start, part.minutes);
+    }
+    const progressAfter = this.getAvailabilityRequestProgress(input.requestId)!;
+    this.connection.prepare("UPDATE availability_requests SET status = ?, updated_at = ? WHERE id = ?")
+      .run(progressAfter.remainingMinutes <= 0 ? "fulfilled" : "open", now, input.requestId);
     return { meeting: this.getMeetingById(meetingId)!, alreadyExisted: false };
   });
   }
@@ -2336,12 +2338,36 @@ END;
   throw new Error("Could not generate a unique access key after 100 attempts");
   }
 
-  private assertContained(start: string, end: string, intervalStart: string, durationMinutes: number, label: string): void {
-  const intervalEnd = this.addMinutes(intervalStart, durationMinutes);
-  if (Date.parse(start) < Date.parse(intervalStart) || Date.parse(end) > Date.parse(intervalEnd)) {
-    throw new Error(`Selected interval is outside the available ${label.toLowerCase()}`);
+  /** True when the rows (start_at, duration_minutes, sorted by start) cover [start, end) without any gap. */
+  private rowsCover(rows: RawRow[], start: string, end: string): boolean {
+  const endMs = Date.parse(end);
+  let coveredUntil = Date.parse(start);
+  for (const row of rows) {
+    const rowStart = Date.parse(String(row.start_at));
+    const rowEnd = rowStart + Number(row.duration_minutes) * 60_000;
+    if (rowEnd <= coveredUntil) continue;
+    if (rowStart > coveredUntil) break;
+    coveredUntil = rowEnd;
+    if (coveredUntil >= endMs) return true;
   }
+  return coveredUntil >= endMs;
   }
+
+  /** Part of each row that intersects [start, end), as a start date and a duration in minutes. */
+  private intersections(rows: RawRow[], start: string, end: string): Array<{ row: RawRow; start: string; minutes: number }> {
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  const out: Array<{ row: RawRow; start: string; minutes: number }> = [];
+  for (const row of rows) {
+    const rowStart = Date.parse(String(row.start_at));
+    const rowEnd = rowStart + Number(row.duration_minutes) * 60_000;
+    const s = Math.max(rowStart, startMs);
+    const e = Math.min(rowEnd, endMs);
+    if (e > s) out.push({ row, start: new Date(s).toISOString(), minutes: Math.floor((e - s) / 60_000) });
+  }
+  return out;
+  }
+
 
   private assertNoDisponibilityOverlap(
   assignationId: number,

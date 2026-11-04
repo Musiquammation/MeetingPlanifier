@@ -179,11 +179,11 @@
 			<template x-if="consumers.length">
 				<div role="region" tabindex="0" aria-label="Consommateurs">
 					<table>
-						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Clé d’accès</th><th>Formule par défaut</th></tr></thead>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Clé d’accès <small>(cliquer pour copier le lien)</small></th><th>Formule par défaut</th></tr></thead>
 						<tbody>
 							<template x-for="c in consumers" :key="consumerKey(c)">
 								<tr>
-									<td x-text="consumerLabel(c)"></td><td x-text="consumerOf(c).username"></td><td x-text="fidelityKey(c)"></td>
+									<td x-text="consumerLabel(c)"></td><td x-text="consumerOf(c).username"></td><td><button type="button" data-copy @click="copyConsumerLink(c)" :title="'Copier le lien d’accès de ' + consumerLabel(c)"><code x-text="fidelityKey(c)"></code> Copier le lien</button></td>
 									<td>
 										<select :aria-label="'Formule par défaut de ' + consumerLabel(c)" @change="setConsumerPackage(c, $event.target.value)" :disabled="busy">
 											<option value="" :selected="defaultPackageId(c) === null" x-text="'Aucune (' + money(0) + ')'"></option>
@@ -757,12 +757,17 @@
 			<template x-if="page === 'agent-agenda' && assignations.length">
 				<fieldset data-consumers>
 					<legend>Disponibilités des consommateurs</legend>
-					<!-- Only the consumers who still ask for hours (open request with hours left to schedule) -->
-					<label><input type="checkbox" :checked="onlyRequesters" @change="toggleRequesters()"> <b>Demandeurs</b> <small>(ceux qui demandent encore des heures)</small></label>
-					<label><input type="checkbox" :checked="visibleAssignations().every(x => isShown(x.id))" @change="setAllConsumers($event.target.checked)"> Tous</label><br>
-					<template x-for="x in visibleAssignations()" :key="x.id">
-						<label><input type="checkbox" :checked="isShown(x.id)" @change="toggleConsumer(x.id)"> <span x-text="consumerLabel(x)"></span></label>
-					</template>
+					<div data-row>
+						<!-- Only the consumers who still ask for hours (open request with hours left to schedule) -->
+						<label data-chip><input type="checkbox" :checked="onlyRequesters" @change="toggleRequesters()"> Demandeurs <small>(heures encore à planifier)</small></label>
+						<label data-chip><input type="checkbox" :checked="visibleAssignations().length > 0 && visibleAssignations().every(x => isShown(x.id))" :disabled="!visibleAssignations().length" @change="setAllConsumers($event.target.checked)"> Tous</label>
+					</div>
+					<div data-row>
+						<template x-for="x in visibleAssignations()" :key="x.id">
+							<label data-chip><input type="checkbox" :checked="isShown(x.id)" @change="toggleConsumer(x.id)"> <span x-text="consumerLabel(x)"></span></label>
+						</template>
+						<template x-if="!visibleAssignations().length"><p><small>Aucun consommateur ne demande encore des heures.</small></p></template>
+					</div>
 				</fieldset>
 			</template>
 
@@ -832,9 +837,10 @@
 					</ol>
 					<template x-for="d in cal.days" :key="cal.key(d)">
 						<div data-day role="group" :aria-label="cal.longDay(d)" :data-today="cal.isToday(d)"
-							@pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()">
+							@pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()"
+							@touchmove="cal.touchMove($event)" @contextmenu.prevent>
 							<template x-for="p in cal.layoutFor(d)" :key="p.ev.id">
-								<button type="button" data-event :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" @pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
+								<button type="button" data-event :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
 									:aria-label="kindLabel(p.ev.kind) + ', ' + p.ev.title + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
 									<b x-text="kindLabel(p.ev.kind)"></b>
 									<span x-text="p.ev.title"></span>
