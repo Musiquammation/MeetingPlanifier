@@ -764,25 +764,49 @@ export class DomHandler {
 		});
 	}
 
+	/** Agent of one of my assignations (consumer side). */
+	agentOf(assignationId: number): string {
+		const a = this.agentsList.find((x) => this.assignId(x) === assignationId);
+		return a ? this.agentLabel(a) : "Agent";
+	}
+
+	/**
+	 * Calendar events. The title is the other person (the consumer for the agent, the agent for the consumer).
+	 * Meetings no longer consume availabilities and suggestions on the server: they are only cut out of them here,
+	 * so an interval is drawn as the pieces left around the meetings.
+	 */
 	private buildEvents(): CalEvent[] {
-		const mk = (kind: EventKind, x: any, title: string, editable = false, status?: string): CalEvent => ({
-			id: `${kind}-${x.id}`, kind, title, status, editable, love: x.love, raw: x,
-			start: new Date(x.startAt), end: new Date(Date.parse(x.startAt) + x.durationMinutes * 60000)
+		const span = (x: any) => ({ s: Date.parse(x.startAt), e: Date.parse(x.startAt) + x.durationMinutes * 60000 });
+		// Cancelled meetings are not drawn in the calendar: they are listed in their own section
+		const meetings = this.meetings.filter((m) => m.status !== "canceledBy");
+		const busy = meetings.map(span).sort((a, b) => a.s - b.s);
+		const mk = (kind: EventKind, x: any, title: string, editable = false, status?: string, s = span(x).s, e = span(x).e): CalEvent => ({
+			id: `${kind}-${x.id}-${s}`, kind, title, status, editable, love: x.love, raw: x, start: new Date(s), end: new Date(e)
 		});
+		const cut = (kind: EventKind, x: any, title: string, editable = false): CalEvent[] => {
+			const out: CalEvent[] = [];
+			let { s, e } = span(x);
+			for (const b of busy) {
+				if (b.e <= s || b.s >= e) continue;
+				if (b.s > s) out.push(mk(kind, x, title, editable, undefined, s, b.s));
+				s = Math.max(s, b.e);
+			}
+			if (e > s) out.push(mk(kind, x, title, editable, undefined, s, e));
+			return out;
+		};
 		const out: CalEvent[] = [];
 		const agent = this.role === "agent";
-		// Cancelled meetings are not drawn in the calendar: they are listed in their own section
-		for (const m of this.meetings) if (m.status !== "canceledBy") out.push(mk("meeting", m, agent ? this.who(m.assignationId) : "Rendez-vous", false, m.status));
+		for (const m of meetings) out.push(mk("meeting", m, agent ? this.who(m.assignationId) : this.agentOf(m.assignationId), false, m.status));
 		if (agent) {
-			for (const s of this.suggestions) out.push(mk("suggestion", s, "Mes horaires", true));
-			for (const d of this.dispos) if (this.isVisible(d.assignationId)) out.push(mk("dispo", d, this.who(d.assignationId)));
+			for (const s of this.suggestions) out.push(...cut("suggestion", s, "Mes horaires", true));
+			for (const d of this.dispos) if (this.isVisible(d.assignationId)) out.push(...cut("dispo", d, this.who(d.assignationId)));
 		} else {
 			for (const s of this.slots) {
 				const target = s.assignationId;
 				if (this.selAssign !== null && target !== undefined && target !== this.selAssign) continue;
-				out.push(mk("slot", s, "Agent disponible"));
+				out.push(...cut("slot", s, this.agentOf(target ?? this.selAssign)));
 			}
-			for (const d of this.dispos) out.push(mk("dispo", d, "Ma disponibilité", true));
+			for (const d of this.dispos) out.push(...cut("dispo", d, "Ma disponibilité", true));
 		}
 		return out;
 	}
@@ -883,7 +907,7 @@ export class DomHandler {
 		if (ev.kind === "dispo" && this.role === "agent") return void this.openBook(ev);
 		this.panel = { // editing one of my own intervals
 			type: "interval", error: "",
-			form: { id: ev.raw.id, start: toLocalInput(ev.start), duration: ev.raw.durationMinutes, love: ev.raw.love ?? 0.5, contractId: ev.raw.contractId }
+			form: { id: ev.raw.id, start: toLocalInput(new Date(ev.raw.startAt)), duration: ev.raw.durationMinutes, love: ev.raw.love ?? 0.5, contractId: ev.raw.contractId }
 		};
 	}
 

@@ -1880,7 +1880,31 @@ END;
      AND julianday(s.start_at, '+' || s.duration_minutes || ' minutes') > julianday(?)
      ORDER BY s.start_at`,
   ).all(consumerId, rangeEnd, rangeStart) as RawRow[];
-  return rows.map((row) => ({ ...this.mapSuggestion(row), assignationId: Number(row.assignation_id) }));
+  // Meetings do not consume suggestions any more: the agent's meetings (with anybody) are cut out of the hours
+  // shown to the consumer, who cannot see those meetings otherwise.
+  const busyStatement = this.connection.prepare(
+    `SELECT m.start_at, m.duration_minutes FROM meetings m JOIN assignations a ON a.id = m.assignation_id
+     WHERE a.agent_id = (SELECT agent_id FROM contracts WHERE id = ?) AND m.status <> 'canceledBy'
+     AND julianday(m.start_at) < julianday(?)
+     AND julianday(m.start_at, '+' || m.duration_minutes || ' minutes') > julianday(?)
+     ORDER BY m.start_at`,
+  );
+  const out: Array<Suggestion & { assignationId: number }> = [];
+  for (const row of rows) {
+    const suggestion = { ...this.mapSuggestion(row), assignationId: Number(row.assignation_id) };
+    let start = Date.parse(suggestion.startAt);
+    const end = start + suggestion.durationMinutes * 60_000;
+    const busy = busyStatement.all(suggestion.contractId, new Date(end).toISOString(), suggestion.startAt) as RawRow[];
+    const piece = (s: number, e: number) => out.push({ ...suggestion, startAt: new Date(s).toISOString(), durationMinutes: Math.round((e - s) / 60_000) });
+    for (const m of busy) {
+    const ms = Date.parse(String(m.start_at));
+    const me = ms + Number(m.duration_minutes) * 60_000;
+    if (ms > start) piece(start, ms);
+    start = Math.max(start, me);
+    }
+    if (end > start) piece(start, end);
+  }
+  return out;
   }
 
   getAgendaForConsumer(consumerId: number, from: string | Date, to: string | Date): {
@@ -2063,13 +2087,8 @@ END;
     );
     const meetingId = Number(insert.lastInsertRowid);
 
-    // Consume the booked range from every interval it intersects (adjacent rows can jointly cover a meeting).
-    for (const part of this.intersections(availabilityRows, startAt, endAt)) {
-      this.splitDisponibility(this.mapDisponibility(part.row), part.start, part.minutes);
-    }
-    for (const part of this.intersections(suggestionRows, startAt, endAt)) {
-      this.splitSuggestion(this.mapSuggestion(part.row), part.start, part.minutes);
-    }
+    // Availabilities and suggestions are kept as they are: the meeting is drawn over them and the overlap
+    // check above (agent and consumer meetings) prevents booking the same time twice.
     const progressAfter = this.getAvailabilityRequestProgress(input.requestId)!;
     this.connection.prepare("UPDATE availability_requests SET status = ?, updated_at = ? WHERE id = ?")
       .run(progressAfter.remainingMinutes <= 0 ? "fulfilled" : "open", now, input.requestId);
@@ -2207,7 +2226,7 @@ END;
   return meeting;
   }
 
-  /** Cancel a meeting and restore its future availability only when restoration cannot overlap existing intervals. */
+  /** Cancel a meeting; the availabilities and suggestions it was drawn over are still there. */
   cancelMeeting(id: number, actorRole: Role, actorId: number, now: string | Date = new Date()): Meeting {
   this.assertRole(actorRole);
   this.assertInteger(actorId, "Actor id", 1);
@@ -2220,46 +2239,12 @@ END;
     this.connection.prepare(
     `UPDATE meetings SET status = 'canceledBy', canceled_by_role = ?, canceled_by_id = ?, updated_at = ? WHERE id = ?`,
     ).run(actorRole, actorId, reference, id);
-    if (Date.parse(meeting.startAt) > Date.parse(reference) && meeting.availabilityRequestId !== null &&
-      meeting.sourceContractId !== null && meeting.sourceDisponibilityLove !== null && meeting.sourceSuggestionLove !== null) {
-    const request = this.getAvailabilityRequest(meeting.availabilityRequestId);
-    if (request && request.status !== "closed") {
-      const timestamp = this.nowIso();
-      const endAt = this.addMinutes(meeting.startAt, meeting.durationMinutes);
-      const dispoOverlap = this.connection.prepare(
-      `SELECT id FROM disponibilities WHERE assignation_id = ? AND request_id = ?
-       AND julianday(start_at) < julianday(?)
-       AND julianday(start_at, '+' || duration_minutes || ' minutes') > julianday(?) LIMIT 1`,
-      ).get(meeting.assignationId, request.id, endAt, meeting.startAt) as RawRow | undefined;
-      if (!dispoOverlap) {
-      const restored = this.connection.prepare(
-        `INSERT INTO disponibilities (assignation_id, request_id, start_at, duration_minutes, love, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(meeting.assignationId, request.id, meeting.startAt, meeting.durationMinutes,
-        meeting.sourceDisponibilityLove, timestamp, timestamp);
-      // The freed slot may touch availabilities of the same preference: they become one single availability.
-      this.mergeTouchingIntervals("disponibilities", Number(restored.lastInsertRowid));
-      }
-      const suggestionOverlap = this.connection.prepare(
-      `SELECT s.id FROM suggestions s JOIN contracts c ON c.id = s.contract_id
-       WHERE c.agent_id = (SELECT agent_id FROM contracts WHERE id = ?)
-         AND julianday(s.start_at) < julianday(?)
-         AND julianday(s.start_at, '+' || s.duration_minutes || ' minutes') > julianday(?) LIMIT 1`,
-      ).get(meeting.sourceContractId, endAt, meeting.startAt) as RawRow | undefined;
-      if (!suggestionOverlap) {
-      const restored = this.connection.prepare(
-        `INSERT INTO suggestions (contract_id, start_at, duration_minutes, love, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(meeting.sourceContractId, meeting.startAt, meeting.durationMinutes,
-        meeting.sourceSuggestionLove, timestamp, timestamp);
-      // Same for the agent's opening hours.
-      this.mergeTouchingIntervals("suggestions", Number(restored.lastInsertRowid));
-      }
-      const progress = this.getAvailabilityRequestProgress(request.id)!;
-      if (progress.remainingMinutes > 0 && request.status === "fulfilled") {
+    // Availabilities and suggestions were never consumed: only the request may need to be reopened.
+    if (meeting.availabilityRequestId !== null) {
+    const request = this.getAvailabilityRequestProgress(meeting.availabilityRequestId);
+    if (request && request.status === "fulfilled" && request.remainingMinutes > 0) {
       this.connection.prepare("UPDATE availability_requests SET status = 'open', updated_at = ? WHERE id = ?")
-        .run(timestamp, request.id);
-      }
+      .run(reference, request.id);
     }
     }
     return this.getMeetingById(id)!;
@@ -2353,22 +2338,6 @@ END;
   return coveredUntil >= endMs;
   }
 
-  /** Part of each row that intersects [start, end), as a start date and a duration in minutes. */
-  private intersections(rows: RawRow[], start: string, end: string): Array<{ row: RawRow; start: string; minutes: number }> {
-  const startMs = Date.parse(start);
-  const endMs = Date.parse(end);
-  const out: Array<{ row: RawRow; start: string; minutes: number }> = [];
-  for (const row of rows) {
-    const rowStart = Date.parse(String(row.start_at));
-    const rowEnd = rowStart + Number(row.duration_minutes) * 60_000;
-    const s = Math.max(rowStart, startMs);
-    const e = Math.min(rowEnd, endMs);
-    if (e > s) out.push({ row, start: new Date(s).toISOString(), minutes: Math.floor((e - s) / 60_000) });
-  }
-  return out;
-  }
-
-
   private assertNoDisponibilityOverlap(
   assignationId: number,
   requestId: number,
@@ -2402,96 +2371,6 @@ END;
      LIMIT 1`,
   ).get(agentId, excludeId ?? null, excludeId ?? null, endAt, startAt);
   if (overlap) throw new Error("Suggestions for the same agent cannot overlap");
-  }
-
-  private splitDisponibility(disponibility: Disponibility, consumedStart: string, consumedDuration: number): void {
-  const oldStartMs = Date.parse(disponibility.startAt);
-  const oldEndMs = oldStartMs + disponibility.durationMinutes * 60_000;
-  const newStartMs = Date.parse(consumedStart);
-  const newEndMs = newStartMs + consumedDuration * 60_000;
-  this.connection.prepare("DELETE FROM disponibilities WHERE id = ?").run(disponibility.id);
-  const timestamp = this.nowIso();
-  if (newStartMs > oldStartMs) {
-    const leftMinutes = Math.floor((newStartMs - oldStartMs) / 60_000);
-    if (leftMinutes > 0) this.connection.prepare(
-    `INSERT INTO disponibilities (assignation_id, request_id, start_at, duration_minutes, love, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(disponibility.assignationId, disponibility.requestId, disponibility.startAt, leftMinutes, disponibility.love, timestamp, timestamp);
-  }
-  if (newEndMs < oldEndMs) {
-    const rightMinutes = Math.floor((oldEndMs - newEndMs) / 60_000);
-    if (rightMinutes > 0) this.connection.prepare(
-    `INSERT INTO disponibilities (assignation_id, request_id, start_at, duration_minutes, love, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(disponibility.assignationId, disponibility.requestId, new Date(newEndMs).toISOString(), rightMinutes, disponibility.love, timestamp, timestamp);
-  }
-  }
-
-  private splitSuggestion(suggestion: Suggestion, consumedStart: string, consumedDuration: number): void {
-  const oldStartMs = Date.parse(suggestion.startAt);
-  const oldEndMs = oldStartMs + suggestion.durationMinutes * 60_000;
-  const newStartMs = Date.parse(consumedStart);
-  const newEndMs = newStartMs + consumedDuration * 60_000;
-  this.connection.prepare("DELETE FROM suggestions WHERE id = ?").run(suggestion.id);
-  const timestamp = this.nowIso();
-  if (newStartMs > oldStartMs) {
-    const leftMinutes = Math.floor((newStartMs - oldStartMs) / 60_000);
-    if (leftMinutes > 0) this.connection.prepare(
-    `INSERT INTO suggestions (contract_id, start_at, duration_minutes, love, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(suggestion.contractId, suggestion.startAt, leftMinutes, suggestion.love, timestamp, timestamp);
-  }
-  if (newEndMs < oldEndMs) {
-    const rightMinutes = Math.floor((oldEndMs - newEndMs) / 60_000);
-    if (rightMinutes > 0) this.connection.prepare(
-    `INSERT INTO suggestions (contract_id, start_at, duration_minutes, love, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(suggestion.contractId, new Date(newEndMs).toISOString(), rightMinutes, suggestion.love, timestamp, timestamp);
-  }
-  }
-
-  /**
-   * Merge an interval with the intervals of the same owner that touch it (end = start) and have the same preference.
-   * The interval with the given id absorbs them (before and after, repeatedly), so a restored slot sitting between
-   * two slots of equal preference gives back a single long interval. Intervals of another preference are never touched,
-   * and a merge that would exceed the maximum interval length is skipped.
-   * Owner of a disponibility = same assignation and same request; owner of a suggestion = same contract.
-   */
-  private mergeTouchingIntervals(table: "disponibilities" | "suggestions", id: number): void {
-  const ownerColumns = table === "disponibilities" ? ["assignation_id", "request_id"] : ["contract_id"];
-  const current = this.connection.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id) as RawRow | undefined;
-  if (!current) return;
-  const owner = ownerColumns.map((column) => current[column]);
-  // Normalize missing SQLite values to NULL before binding; node:sqlite does not accept undefined.
-   const siblings = this.connection.prepare(
-    `SELECT * FROM ${table} WHERE ${ownerColumns.map((column) => `${column} = ?`).join(" AND ")} AND id <> ?`,
-  ).all(...owner.map((value) => value ?? null), id) as RawRow[];
-  const love = Number(current.love);
-  let start = Date.parse(String(current.start_at));
-  let end = start + Number(current.duration_minutes) * 60_000;
-  const absorbed = new Set<number>();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const sibling of siblings) {
-    const siblingId = Number(sibling.id);
-    if (absorbed.has(siblingId) || Math.abs(Number(sibling.love) - love) > LOVE_EPSILON) continue;
-    const siblingStart = Date.parse(String(sibling.start_at));
-    const siblingEnd = siblingStart + Number(sibling.duration_minutes) * 60_000;
-    if (siblingEnd !== start && siblingStart !== end) continue; // not touching
-    const mergedStart = Math.min(start, siblingStart);
-    const mergedEnd = Math.max(end, siblingEnd);
-    if ((mergedEnd - mergedStart) / 60_000 > MAX_INTERVAL_MINUTES) continue;
-    start = mergedStart; end = mergedEnd;
-    absorbed.add(siblingId);
-    changed = true;
-    }
-  }
-  if (!absorbed.size) return;
-  const remove = this.connection.prepare(`DELETE FROM ${table} WHERE id = ?`);
-  for (const siblingId of absorbed) remove.run(siblingId);
-  this.connection.prepare(`UPDATE ${table} SET start_at = ?, duration_minutes = ?, updated_at = ? WHERE id = ?`)
-    .run(new Date(start).toISOString(), Math.round((end - start) / 60_000), this.nowIso(), id);
   }
 
   private trimInterval(table: "disponibilities" | "suggestions", id: number, oldStart: string, oldDuration: number, now: string): void {

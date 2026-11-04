@@ -772,11 +772,7 @@
 			</template>
 
 			<div role="toolbar" aria-label="Navigation de l’agenda" data-toolbar>
-				<div role="group" aria-label="Période">
-					<button type="button" @click="cal.prev()" aria-label="Période précédente">‹</button>
-					<button type="button" @click="cal.today()">Aujourd’hui</button>
-					<button type="button" @click="cal.next()" aria-label="Période suivante">›</button>
-				</div>
+				<button type="button" @click="cal.today()">Aujourd’hui</button>
 				<p data-range aria-live="polite" x-text="cal.title"></p>
 				<div role="group" aria-label="Affichage">
 					<button type="button" @click="cal.setView('day')" :aria-pressed="cal.settings.mode === 'days' && cal.count === 1">Jour</button>
@@ -824,12 +820,14 @@
 
 			<div data-scroll x-ref="scroller" @touchstart.passive="cal.swipeStart($event)" @touchend="cal.swipeEnd($event)" :aria-busy="loading">
 				<div data-head>
-					<span></span>
+					<!-- Previous / next period sit on the row of the dates, next to what they change -->
+					<button type="button" data-nav="prev" @click="cal.prev()" aria-label="Période précédente">‹</button>
 					<template x-for="d in cal.days" :key="cal.key(d)">
 						<button type="button" data-day-head :data-today="cal.isToday(d)" @click="cal.focusDay(d)" :aria-label="'Afficher uniquement ' + cal.longDay(d)">
 							<span x-text="cal.dayName(d)"></span><b x-text="cal.dayNum(d)"></b>
 						</button>
 					</template>
+					<button type="button" data-nav="next" @click="cal.next()" aria-label="Période suivante">›</button>
 				</div>
 				<div data-grid>
 					<ol data-hours aria-hidden="true">
@@ -841,9 +839,9 @@
 							@touchmove="cal.touchMove($event)" @contextmenu.prevent>
 							<template x-for="p in cal.layoutFor(d)" :key="p.ev.id">
 								<button type="button" data-event :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
-									:aria-label="kindLabel(p.ev.kind) + ', ' + p.ev.title + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
-									<b x-text="kindLabel(p.ev.kind)"></b>
-									<span x-text="p.ev.title"></span>
+									:aria-label="kindLabel(p.ev.kind) + ', ' + p.ev.title + (p.ev.love != null ? ', préférence ' + Math.round(p.ev.love * 100) + ' %' : '') + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
+									<b x-text="p.ev.title"></b>
+									<template x-if="p.ev.love != null"><small data-love title="Préférence" x-text="Math.round(p.ev.love * 100) + ' %'"></small></template>
 									<time x-text="cal.time(p.ev.start) + ' – ' + cal.time(p.ev.end)"></time>
 								</button>
 							</template>

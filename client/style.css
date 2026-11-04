@@ -309,6 +309,29 @@ button[aria-pressed="true"] { background: var(--pine); color: var(--pine-ink); b
 [data-day-head] b { display: grid; place-items: center; min-width: 2.2rem; height: 2.2rem; border-radius: 50%; font-size: 1.15rem; color: var(--ink); }
 [data-day-head][data-today] b { background: var(--pine); color: var(--pine-ink); }
 
+/* Previous / next period: "‹" fills the hours gutter, "›" sits on the right end of the dates row */
+[data-head] [data-nav] {
+	min-width: 0;
+	min-height: 0;
+	padding: 0;
+	border: 0;
+	border-radius: 0;
+	font-size: 1.6rem;
+	line-height: 1;
+	color: var(--pine);
+	background: var(--surface);
+}
+[data-head] [data-nav]:hover { background: color-mix(in srgb, var(--pine) 10%, var(--surface)); }
+[data-head] [data-nav="next"] {
+	position: absolute;
+	top: 0;
+	right: 0;
+	bottom: 0;
+	width: 2rem;
+	border-left: 1px solid var(--line);
+}
+[data-head] [data-day-head]:nth-last-child(2) { padding-right: 2rem; }
+
 [data-hours] { position: sticky; left: 0; z-index: 3; margin: 0; padding: 0; list-style: none; background: var(--surface); }
 [data-hours] li { height: var(--hour); padding-right: 0.4rem; text-align: right; font-size: 0.75rem; color: var(--muted); transform: translateY(-0.5em); }
 
@@ -354,7 +377,8 @@ button[aria-pressed="true"] { background: var(--pine); color: var(--pine-ink); b
 	border-style: solid;
 }
 
-[data-event] b { font-weight: 700; }
+[data-event] b { font-weight: 700; max-width: 100%; overflow-wrap: anywhere; }
+[data-event] [data-love] { color: inherit; opacity: 0.8; font-size: 0.68rem; }
 [data-event] time { color: inherit; opacity: 0.85; }
 
 [data-kind="slot"] { background: var(--amber-bg); border: 1px dashed var(--amber); color: var(--ink); }
