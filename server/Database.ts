@@ -255,6 +255,39 @@ export interface CleanupResult {
   trimmedSuggestions: number;
 }
 
+/** Userscript of an agent; secrets are only read on the server (the API never returns their values). */
+export interface AgentScript {
+  agentId: number;
+  code: string;
+  enabled: boolean;
+  secrets: Record<string, string>;
+  updatedAt: string | null;
+}
+
+export interface AgentScriptRun {
+  id: number;
+  agentId: number;
+  trigger: "event" | "test";
+  eventType: string;
+  meetingId: number | null;
+  status: "ok" | "error" | "timeout" | "skipped";
+  durationMs: number;
+  logs: string[];
+  result: string | null;
+  error: string | null;
+  createdAt: string;
+}
+
+export interface UserscriptMeetingContext {
+  meeting: Meeting;
+  assignationId: number;
+  intercourseMinutes: number;
+  agent: Pick<Agent, "id" | "name" | "surname" | "username">;
+  company: { id: number; name: string; societyRate: number };
+  consumer: Pick<Consumer, "id" | "name" | "surname" | "username"> & { key: string };
+  package: { id: number; name: string; hourlyRate: number } | null;
+}
+
 interface RawRow {
   [key: string]: string | number | bigint | null | Uint8Array | undefined;
 }
@@ -481,6 +514,34 @@ CREATE INDEX IF NOT EXISTS idx_meetings_assignation_start ON meetings(assignatio
 CREATE INDEX IF NOT EXISTS idx_meetings_request_status ON meetings(availability_request_id, status);
 CREATE INDEX IF NOT EXISTS idx_meetings_room_start ON meetings(room_company_id, room_name, start_at, status);
 CREATE INDEX IF NOT EXISTS idx_meetings_status_start ON meetings(status, start_at);
+
+-- Userscript of an agent (see USERSCRIPT_API.md): JS code run in a sandbox on meeting events.
+-- secrets_json is a JSON object { NAME: "value" } that is never sent back to the client.
+CREATE TABLE IF NOT EXISTS agent_scripts (
+  agent_id INTEGER PRIMARY KEY,
+  code TEXT NOT NULL DEFAULT '' CHECK (length(code) <= 100000),
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+  secrets_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+);
+
+-- History of the userscript executions of an agent (only the latest ones are kept).
+CREATE TABLE IF NOT EXISTS agent_script_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  trigger TEXT NOT NULL CHECK (trigger IN ('event', 'test')),
+  event_type TEXT NOT NULL,
+  meeting_id INTEGER,
+  status TEXT NOT NULL CHECK (status IN ('ok', 'error', 'timeout', 'skipped')),
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  logs TEXT NOT NULL DEFAULT '[]',
+  result TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_script_runs_agent ON agent_script_runs(agent_id, id);
 
 CREATE TRIGGER IF NOT EXISTS trg_assignation_company_match_insert
 BEFORE INSERT ON assignations
@@ -1034,9 +1095,13 @@ END;
   if (!this.getConsumerById(id)) throw new Error("Consumer not found");
   }
 
-  createFidelity(companyId: number, consumerId: number): Fidelity {
+  /** `key` forces the access key (test data); it must be 6 characters and unused. */
+  createFidelity(companyId: number, consumerId: number, key?: string): Fidelity {
   return this.withTransaction(() => {
-    const key = this.generateUniqueKey();
+    if (key !== undefined && (key.length !== KEY_LENGTH || this.connection.prepare(
+    "SELECT 1 AS found FROM consumers WHERE key = ? UNION ALL SELECT 1 AS found FROM fidelities WHERE key = ? LIMIT 1",
+    ).get(key, key))) throw new Error(`Access key must be ${KEY_LENGTH} characters and unused`);
+    key ??= this.generateUniqueKey();
     const result = this.connection.prepare(
     "INSERT INTO fidelities (key, company_id, consumer_id, active, created_at) VALUES (?, ?, ?, 1, ?)",
     ).run(key, companyId, consumerId, this.nowIso());
@@ -2336,6 +2401,141 @@ END;
     }
     return this.getMeetingById(id)!;
   });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Agent userscripts (code, secrets, execution history)
+  // ---------------------------------------------------------------------------
+
+  /** Userscript of an agent; an agent without a row has an empty, disabled script. */
+  getAgentScript(agentId: number): AgentScript {
+  const row = this.connection.prepare(
+    "SELECT agent_id, code, enabled, secrets_json, updated_at FROM agent_scripts WHERE agent_id = ?",
+  ).get(agentId) as RawRow | undefined;
+  if (!row) return { agentId, code: "", enabled: false, secrets: {}, updatedAt: null };
+  let secrets: Record<string, string> = {};
+  try {
+    const parsed = JSON.parse(String(row.secrets_json ?? "{}"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) if (typeof v === "string") secrets[k] = v;
+    }
+  } catch { secrets = {}; }
+  return { agentId, code: String(row.code ?? ""), enabled: Number(row.enabled) === 1, secrets, updatedAt: String(row.updated_at) };
+  }
+
+  /** Save the code and/or the enabled flag; undefined fields keep their value. */
+  saveAgentScript(agentId: number, input: { code?: string; enabled?: boolean }): AgentScript {
+  if (input.code !== undefined && (typeof input.code !== "string" || input.code.length > 100000)) {
+    throw new Error("Script code cannot exceed 100000 characters");
+  }
+  return this.withTransaction(() => {
+    const current = this.getAgentScript(agentId);
+    const code = input.code ?? current.code;
+    const enabled = input.enabled ?? current.enabled;
+    this.connection.prepare(
+    `INSERT INTO agent_scripts (agent_id, code, enabled, secrets_json, updated_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (agent_id) DO UPDATE SET code = excluded.code, enabled = excluded.enabled, updated_at = excluded.updated_at`,
+    ).run(agentId, code, enabled ? 1 : 0, JSON.stringify(current.secrets), this.nowIso());
+    return this.getAgentScript(agentId);
+  });
+  }
+
+  /**
+   * Change some secrets of an agent: a string sets the value, null removes the secret, other names are kept.
+   * Names are identifiers (A-Z, a-z, 0-9, _), at most 50 secrets of 4096 characters each.
+   */
+  updateAgentScriptSecrets(agentId: number, changes: Record<string, string | null>): AgentScript {
+  return this.withTransaction(() => {
+    const current = this.getAgentScript(agentId);
+    const secrets = { ...current.secrets };
+    for (const [name, value] of Object.entries(changes)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) throw new Error(`Invalid secret name: ${name.slice(0, 64)}`);
+    if (value === null) { delete secrets[name]; continue; }
+    if (typeof value !== "string" || value.length > 4096) throw new Error("A secret value must be a string of at most 4096 characters");
+    secrets[name] = value;
+    }
+    if (Object.keys(secrets).length > 50) throw new Error("An agent cannot have more than 50 secrets");
+    this.connection.prepare(
+    `INSERT INTO agent_scripts (agent_id, code, enabled, secrets_json, updated_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (agent_id) DO UPDATE SET secrets_json = excluded.secrets_json, updated_at = excluded.updated_at`,
+    ).run(agentId, current.code, current.enabled ? 1 : 0, JSON.stringify(secrets), this.nowIso());
+    return this.getAgentScript(agentId);
+  });
+  }
+
+  /** Store one execution and keep only the latest `keep` ones of the agent. */
+  addAgentScriptRun(input: Omit<AgentScriptRun, "id" | "createdAt">, keep = 30): AgentScriptRun {
+  return this.withTransaction(() => {
+    const now = this.nowIso();
+    const result = this.connection.prepare(
+    `INSERT INTO agent_script_runs (agent_id, trigger, event_type, meeting_id, status, duration_ms, logs, result, error, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(input.agentId, input.trigger, input.eventType, input.meetingId, input.status, Math.max(0, Math.round(input.durationMs)),
+    JSON.stringify(input.logs), input.result, input.error, now);
+    this.connection.prepare(
+    `DELETE FROM agent_script_runs WHERE agent_id = ? AND id NOT IN (
+       SELECT id FROM agent_script_runs WHERE agent_id = ? ORDER BY id DESC LIMIT ?)`,
+    ).run(input.agentId, input.agentId, keep);
+    return { ...input, id: Number(result.lastInsertRowid), createdAt: now };
+  });
+  }
+
+  listAgentScriptRuns(agentId: number, limit = 30): AgentScriptRun[] {
+  const rows = this.connection.prepare(
+    "SELECT * FROM agent_script_runs WHERE agent_id = ? ORDER BY id DESC LIMIT ?",
+  ).all(agentId, limit) as RawRow[];
+  return rows.map((row) => {
+    let logs: string[] = [];
+    try { const parsed = JSON.parse(String(row.logs ?? "[]")); if (Array.isArray(parsed)) logs = parsed.map(String); } catch { logs = []; }
+    return {
+    id: Number(row.id), agentId: Number(row.agent_id), trigger: String(row.trigger) as AgentScriptRun["trigger"],
+    eventType: String(row.event_type), meetingId: row.meeting_id === null || row.meeting_id === undefined ? null : Number(row.meeting_id),
+    status: String(row.status) as AgentScriptRun["status"], durationMs: Number(row.duration_ms), logs,
+    result: row.result === null || row.result === undefined ? null : String(row.result),
+    error: row.error === null || row.error === undefined ? null : String(row.error),
+    createdAt: String(row.created_at),
+    };
+  });
+  }
+
+  /**
+   * Everything a userscript may know about a meeting, from the point of view of its agent:
+   * the meeting, its consumer (with the access key of the company), the company, the agent and the package.
+   */
+  getUserscriptMeetingContext(meetingId: number): UserscriptMeetingContext | null {
+  const row = this.connection.prepare(
+    `SELECT m.id AS meeting_id, a.id AS assignation_id, a.agent_id, a.intercourse_minutes,
+        f.id AS fidelity_id, f.key AS fidelity_key, f.company_id,
+        co.id AS consumer_id, co.name AS consumer_name, co.surname AS consumer_surname, co.username AS consumer_username,
+        c.name AS company_name, c.society_rate AS company_society_rate,
+        ag.name AS agent_name, ag.surname AS agent_surname, ag.username AS agent_username,
+        COALESCE(pa.id, pf.id) AS package_id, COALESCE(pa.name, pf.name) AS package_name,
+        COALESCE(pa.hourly_rate, pf.hourly_rate) AS package_rate
+     FROM meetings m
+     JOIN assignations a ON a.id = m.assignation_id
+     JOIN fidelities f ON f.id = a.fidelity_id
+     JOIN consumers co ON co.id = f.consumer_id
+     JOIN companies c ON c.id = f.company_id
+     JOIN agents ag ON ag.id = a.agent_id
+     LEFT JOIN packages pa ON pa.id = a.package_id
+     LEFT JOIN packages pf ON pf.id = f.default_package_id
+     WHERE m.id = ?`,
+  ).get(meetingId) as RawRow | undefined;
+  if (!row) return null;
+  const meeting = this.getMeetingById(meetingId)!;
+  return {
+    meeting,
+    assignationId: Number(row.assignation_id),
+    intercourseMinutes: Number(row.intercourse_minutes ?? 0),
+    agent: { id: Number(row.agent_id), name: String(row.agent_name), surname: String(row.agent_surname), username: String(row.agent_username) },
+    company: { id: Number(row.company_id), name: String(row.company_name), societyRate: Number(row.company_society_rate ?? DEFAULT_SOCIETY_RATE) },
+    consumer: {
+    id: Number(row.consumer_id), name: String(row.consumer_name), surname: String(row.consumer_surname),
+    username: String(row.consumer_username), key: String(row.fidelity_key),
+    },
+    package: row.package_id === null || row.package_id === undefined ? null
+    : { id: Number(row.package_id), name: String(row.package_name), hourlyRate: Number(row.package_rate) },
+  };
   }
 
   // ---------------------------------------------------------------------------

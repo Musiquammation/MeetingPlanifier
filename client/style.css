@@ -252,6 +252,27 @@ td button { margin: 0.15rem 0.25rem 0.15rem 0; }
 [data-key] { padding: 1rem; margin-bottom: 1.5rem; background: var(--amber-bg); border-left: 6px solid var(--amber); border-radius: var(--radius); }
 [data-key] output { display: inline-block; padding: 0.25rem 0.75rem; margin-bottom: 0.5rem; font: 700 1.75rem ui-monospace, Menlo, Consolas, monospace; letter-spacing: 0.15em; background: var(--surface); border-radius: var(--radius); }
 
+/* ---- Agent script ----------------------------------------------------------- */
+
+[data-script] textarea[data-code] {
+	display: block;
+	min-height: 24rem;
+	margin: 0.25rem 0 1rem;
+	font: 0.875rem/1.5 ui-monospace, Menlo, Consolas, monospace;
+	tab-size: 4;
+	white-space: pre;
+	overflow: auto;
+	resize: vertical;
+}
+[data-script] code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.9em; }
+[data-script-test] { grid-template-columns: 1fr 2fr auto; align-items: end; max-width: none; }
+@media (max-width: 40rem) { [data-script-test] { grid-template-columns: 1fr; } }
+[data-run-output] { padding: 0.75rem 1rem; margin-bottom: 1.5rem; background: var(--surface); border: 1px solid var(--line); border-left: 6px solid var(--iris); border-radius: var(--radius); }
+[data-run-output][data-status="error"], [data-run-output][data-status="timeout"] { border-left-color: var(--brick); }
+[data-run-output][data-status="skipped"] { border-left-color: var(--amber); }
+[data-run-output] h3 { margin: 0.75rem 0 0.25rem; font-size: 1rem; }
+[data-run-output] pre { margin: 0; padding: 0.5rem 0.75rem; overflow: auto; max-height: 20rem; font: 0.8125rem/1.45 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; background: var(--paper); border-radius: var(--radius); }
+
 /* ---- Calendar ------------------------------------------------------------- */
 
 [data-cal] { --days: 7; --hours: 15; min-width: 0; }

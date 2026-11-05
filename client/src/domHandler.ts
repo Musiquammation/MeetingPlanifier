@@ -7,7 +7,7 @@ import { Calendar, addDays, toLocalInput, type CalEvent, type EventKind } from "
 import { ResultsView } from "./Results";
 import { fetcher } from "./fetcher";
 import { plan } from "./Planner";
-import type { AvailabilityRequest, Company, IntercoursePair, Meeting, Package, Page, Proposal, Role, Room } from "./types";
+import type { AgentScript, AvailabilityRequest, Company, IntercoursePair, Meeting, Package, Page, Proposal, Role, Room, ScriptRun } from "./types";
 
 /** Required role per page (null = public page). */
 const PAGES: Record<Page, Role | null> = {
@@ -16,7 +16,7 @@ const PAGES: Record<Page, Role | null> = {
 	"admin-dashboard": "admin", "admin-companies": "admin", "admin-consumers": "admin", "admin-agents": "admin", "admin-rooms": "admin",
 	"admin-packages": "admin", "admin-results": "admin",
 	"agent-welcome": null, "agent-login": null, "agent-signup": null,
-	"agent-dashboard": "agent", "agent-companies": "agent", "agent-consumers": "agent", "agent-agenda": "agent", "agent-results": "agent",
+	"agent-dashboard": "agent", "agent-companies": "agent", "agent-consumers": "agent", "agent-agenda": "agent", "agent-results": "agent", "agent-script": "agent",
 	"consumer-welcome": null, "consumer-access": null,
 	"consumer-dashboard": "consumer", "consumer-agenda": "consumer"
 };
@@ -39,6 +39,25 @@ const normRequest = (r: any): AvailabilityRequest => ({
 /** Hours a request still asks for (meetings already booked are not counted). */
 const remainingOf = (r: AvailabilityRequest): number =>
 	r.remainingHours ?? Math.max(0, Math.round((r.requestedHours - (r.scheduledHours ?? 0)) * 10) / 10);
+
+/** Starting point of the script editor (see USERSCRIPT_API.md). */
+const SCRIPT_TEMPLATE = `// Called on every meeting event of your agenda: "new-meeting", "update-meeting", "cancel-meeting" or "valid-meeting".
+// Documentation: USERSCRIPT_API.md. Only env and args exist here (no require, fetch, process...).
+async function userscript(env, args) {
+	const { event, consumers, pricings, societyCommission } = args;
+	const meeting = event.meeting;
+	const consumer = consumers[meeting.consumer];
+	env.log(event.type, meeting.startAt, consumer.name, consumer.surname, meeting.agentAmount + " EUR");
+
+	// Example: send the event to your own service, with a key stored in the secrets.
+	// const res = await env.post("https://example.com/webhook", { type: event.type, meeting }, {
+	// 	headers: { Authorization: "Bearer " + env.secrets.API_KEY },
+	// });
+	// env.log(res.status, res.body);
+}
+`;
+const SCRIPT_EVENTS: Record<string, string> = { "new-meeting": "Nouveau rendez-vous", "update-meeting": "Rendez-vous modifié (salle, commentaire)", "cancel-meeting": "Rendez-vous annulé", "valid-meeting": "Rendez-vous validé (terminé)" };
+const RUN_STATUS: Record<string, string> = { ok: "Réussi", error: "Erreur", timeout: "Temps dépassé", skipped: "Ignoré" };
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
 const horizon = (days: number) => ({ from: new Date().toISOString(), to: addDays(new Date(), days).toISOString() });
@@ -94,6 +113,13 @@ export class DomHandler {
 	// Agent agenda: meetings proposed by the optimizer, kept in memory until validated or erased
 	proposals: Proposal[] = [];
 	planForm = { maxMinutes: 120 }; // longest proposed meeting (default 2 h)
+	// Script page: the code being edited (saved on demand), secrets (names only), test runner and history
+	script: AgentScript | null = null;
+	scriptCode = "";
+	scriptRuns: ScriptRun[] = [];
+	scriptTest: { type: string; meetingId: string; last: ScriptRun | null } = { type: "new-meeting", meetingId: "", last: null };
+	secretForm = { name: "", value: "" };
+	openRun: number | null = null;
 
 	cal = new Calendar();
 
@@ -156,6 +182,7 @@ export class DomHandler {
 		this.packages = []; this.roomMeetings = []; this.res.clear(); this.roomCal.events = [];
 		this.onlyRequesters = false;
 		this.intercoursePairs = []; this.openIntercourse = null; this.proposals = []; this.cal.gaps = [];
+		this.script = null; this.scriptCode = ""; this.scriptRuns = []; this.scriptTest = { type: "new-meeting", meetingId: "", last: null };
 	}
 
 	async logout(): Promise<void> {
@@ -281,6 +308,18 @@ export class DomHandler {
 				return this.load(async () => {
 					const a = await fetcher.agenda(from, to);
 					this.meetings = a.meetings ?? []; this.agentsList = a.agents ?? []; this.requests = (a.requests ?? []).map(normRequest);
+				});
+			case "agent-script":
+				this.secretForm = { name: "", value: "" }; this.openRun = null;
+				this.scriptTest = { ...this.scriptTest, last: null };
+				return this.load(async () => {
+					const [script, runs, agenda] = await Promise.all([fetcher.script(), fetcher.scriptRuns(), fetcher.agenda(ALL_FROM, ALL_TO)]);
+					this.script = script;
+					this.scriptCode = script.code || SCRIPT_TEMPLATE;
+					this.scriptRuns = runs;
+					// Meetings the test can be run on (most recent first)
+					this.meetings = (agenda.meetings ?? []).slice().sort((a: Meeting, b: Meeting) => Date.parse(b.startAt) - Date.parse(a.startAt));
+					this.assignations = agenda.assignations ?? [];
 				});
 			case "agent-agenda": case "consumer-agenda":
 				return this.openAgenda();
@@ -442,6 +481,72 @@ export class DomHandler {
 			const { from, to } = horizon(14);
 			this.meetings = (await fetcher.agenda(from, to)).meetings ?? [];
 		}, "Salle mise à jour.");
+	}
+
+	// ---- Agent script (userscript run on the server, in a sandbox) -------------------
+	scriptEventLabel(t: string): string { return SCRIPT_EVENTS[t] ?? t; }
+	runStatusLabel(s: string): string { return RUN_STATUS[s] ?? s; }
+	scriptDirty(): boolean { return !!this.script && this.scriptCode !== (this.script.code || SCRIPT_TEMPLATE); }
+	meetingOptionLabel(m: Meeting): string {
+		const a = this.assignations.find((x) => x.id === m.assignationId);
+		return `${this.fmt(m.startAt)} · ${a ? this.consumerLabel(a) : "Consommateur"} · ${this.statusLabel(m.status)}`;
+	}
+
+	/** Tab inserts a tab in the code editor instead of leaving it (Escape then Tab leaves it). */
+	scriptTab(e: KeyboardEvent): void {
+		if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+		const el = e.target as HTMLTextAreaElement;
+		e.preventDefault();
+		const { selectionStart: a, selectionEnd: b } = el;
+		this.scriptCode = el.value.slice(0, a) + "\t" + el.value.slice(b);
+		requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = a + 1; });
+	}
+
+	async saveScript() {
+		await this.run(async () => { this.script = await fetcher.saveScript({ code: this.scriptCode }); }, "Script enregistré.");
+	}
+
+	async toggleScript(enabled: boolean) {
+		await this.run(async () => {
+			// Enabling saves the code that is shown, so that what runs is what the agent sees.
+			this.script = await fetcher.saveScript(enabled ? { code: this.scriptCode, enabled } : { enabled });
+		}, enabled ? "Script activé : il sera exécuté à chaque événement de rendez-vous." : "Script désactivé.");
+	}
+
+	resetScriptTemplate() {
+		if (this.scriptCode.trim() && !confirm("Remplacer le code affiché par l’exemple ?")) return;
+		this.scriptCode = SCRIPT_TEMPLATE;
+	}
+
+	async testScript() {
+		await this.run(async () => {
+			this.scriptTest.last = null;
+			this.scriptTest.last = await fetcher.testScript({
+				type: this.scriptTest.type, code: this.scriptCode,
+				meetingId: this.scriptTest.meetingId ? Number(this.scriptTest.meetingId) : null
+			});
+			this.scriptRuns = await fetcher.scriptRuns();
+		});
+	}
+
+	async refreshScriptRuns() {
+		await this.load(async () => { this.scriptRuns = await fetcher.scriptRuns(); });
+	}
+
+	async saveSecret() {
+		const name = this.secretForm.name.trim();
+		await this.run(async () => {
+			if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) throw new Error("Nom invalide : lettres, chiffres et _ uniquement, sans commencer par un chiffre (64 caractères au maximum).");
+			const replaced = this.script?.secretNames.includes(name);
+			this.script = await fetcher.updateSecrets([{ name, value: this.secretForm.value }]);
+			this.secretForm = { name: "", value: "" };
+			this.notice = replaced ? `Secret « ${name} » remplacé.` : `Secret « ${name} » ajouté.`;
+		});
+	}
+
+	async deleteSecret(name: string) {
+		if (!confirm(`Supprimer le secret « ${name} » ?`)) return;
+		await this.run(async () => { this.script = await fetcher.updateSecrets([{ name, value: null }]); }, "Secret supprimé.");
 	}
 
 	// ---- Public pages: authentication ------------------------------------

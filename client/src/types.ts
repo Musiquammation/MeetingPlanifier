@@ -9,7 +9,7 @@ export type Page =
 	| "admin-welcome" | "admin-login" | "admin-signup"
 	| "admin-dashboard" | "admin-companies" | "admin-consumers" | "admin-agents" | "admin-rooms" | "admin-packages" | "admin-results"
 	| "agent-welcome" | "agent-login" | "agent-signup"
-	| "agent-dashboard" | "agent-companies" | "agent-consumers" | "agent-agenda" | "agent-results"
+	| "agent-dashboard" | "agent-companies" | "agent-consumers" | "agent-agenda" | "agent-results" | "agent-script"
 	| "consumer-welcome" | "consumer-access" | "consumer-dashboard" | "consumer-agenda";
 
 /** societyRate (percent) is only sent to administrators: the company takes it on top of the agent's amount (default 28). */
@@ -73,4 +73,27 @@ export interface Proposal { id: string; assignationId: Id; start: Date; end: Dat
 
 declare global {
 	interface Window { SERVER_ADDRESS: string }
+}
+
+/** Userscript of the agent (secret values are write-only: only their names come back). */
+export interface AgentScript {
+	code: string;
+	enabled: boolean;
+	updatedAt: string | null;
+	secretNames: string[];
+	eventTypes: string[];
+	limits: { cpuTimeMs: number; wallTimeMs: number; memoryMb: number; maxRequests: number; requestTimeoutMs: number; maxResponseBytes: number };
+}
+
+export interface ScriptRun {
+	id: number;
+	trigger: "event" | "test";
+	eventType: string;
+	meetingId: number | null;
+	status: "ok" | "error" | "timeout" | "skipped";
+	durationMs: number;
+	logs: string[];
+	result: string | null;
+	error: string | null;
+	createdAt: string;
 }

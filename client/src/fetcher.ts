@@ -22,7 +22,7 @@ function camelize(value: any): any {
 	return value;
 }
 
-import type { IntercoursePair } from "./types";
+import type { AgentScript, IntercoursePair, ScriptRun } from "./types";
 
 type Query = Record<string, string | number | boolean | null | undefined>;
 
@@ -158,6 +158,15 @@ export class Fetcher {
 	}
 	patchMeeting(id: number, b: { comment?: string; roomName?: string | null; status?: "done" }) { return this.patch(`/api/meetings/${id}`, b); }
 	cancelMeeting(id: number) { return this.post(`/api/meetings/${id}/cancel`); }
+
+	// ---- Agent userscript (see USERSCRIPT_API.md) -------------------------
+	script() { return this.get<AgentScript>("/api/agent/script"); }
+	saveScript(b: { code?: string; enabled?: boolean }) { return this.request<AgentScript>("PUT", "/api/agent/script", { body: b }); }
+	/** value null removes the secret; secrets that are not listed are kept. */
+	updateSecrets(secrets: Array<{ name: string; value: string | null }>) { return this.patch<AgentScript>("/api/agent/script/secrets", { secrets }); }
+	/** Runs the code (unsaved draft) on one of my meetings, or on a sample event when meetingId is null. */
+	testScript(b: { type: string; code: string; meetingId: number | null }) { return this.post<ScriptRun>("/api/agent/script/test", b); }
+	scriptRuns() { return this.get<ScriptRun[]>("/api/agent/script/runs"); }
 }
 
 export const fetcher = new Fetcher();

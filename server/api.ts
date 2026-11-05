@@ -2,6 +2,7 @@ import type { Express, Request, Response, NextFunction } from "express";
 import express from "express";
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
+import { DEFAULT_LIMITS, USERSCRIPT_EVENT_TYPES, UserscriptService, type MeetingChanges, type UserscriptEventType } from "./userscript/UserscriptService";
 
 type Role = "admin" | "agent" | "consumer";
 type Session = { role: Role; id: number; companyId?: number; expiresAt: number };
@@ -63,7 +64,7 @@ function intervalInput(body: any) {
  * Enregistre l'ensemble des routes REST sur une application Express.
  * Le paramètre database est une instance de la classe Database documentée dans le projet.
  */
-export function initApi(app: Express, database: Db): void {
+export function initApi(app: Express, database: Db, userscripts: UserscriptService = new UserscriptService(database as any)): void {
   app.use(express.json({ limit: "256kb" }));
 
   app.get("/api/health", (_req, res) => {
@@ -410,7 +411,9 @@ export function initApi(app: Express, database: Db): void {
 	  const from = requiredString(req.body.from, "from", 40);
 	  const to = requiredString(req.body.to, "to", 40);
 	  if (!Number.isFinite(Date.parse(from)) || !Number.isFinite(Date.parse(to)) || Date.parse(from) >= Date.parse(to)) return fail(res, 400, "Plage de dates invalide.");
-	  return res.json(database.autoAssignRooms(companyId(req), from, to));
+	  const result = database.autoAssignRooms(companyId(req), from, to);
+	  for (const a of result.assigned) userscripts.dispatch("update-meeting", a.meetingId, { role: "admin" }, { room: { from: null, to: a.roomName } });
+	  return res.json(result);
 	} catch (e: any) { return fail(res, 400, e.message || "Attribution impossible."); }
   });
   app.patch("/api/rooms/:name", admin, (req, res) => {
@@ -782,6 +785,8 @@ export function initApi(app: Express, database: Db): void {
 						: undefined
 			});
 
+			if (!result.alreadyExisted) userscripts.dispatch("new-meeting", result.meeting.id, { role: "agent" });
+
 			return res.status(201).json({
 				...result,
 				meeting: meetingForRole(
@@ -806,10 +811,18 @@ export function initApi(app: Express, database: Db): void {
 	  if (!meeting) return fail(res, 404, "Réunion introuvable.");
 	  const s = session(req);
 	  if (s.role === "agent" && !database.listAssignationsForAgent(s.id).some((a: any) => a.id === (meeting.assignationId ?? meeting.assignation_id))) return fail(res, 403, "Réunion inaccessible.");
+	  if (req.body.status !== undefined && req.body.status !== "done") return fail(res, 400, "Statut non autorisé.");
+	  const before = meeting;
 	  if (req.body.comment !== undefined) meeting = database.updateMeetingComment(id, String(req.body.comment).slice(0, 2000));
 	  if (req.body.roomName !== undefined) meeting = database.setMeetingRoom(id, req.body.roomName === null || req.body.roomName === "" ? null : requiredString(req.body.roomName, "roomName", 100));
-	  if (req.body.status === "done") meeting = database.markMeetingDone(id);
-	  else if (req.body.status !== undefined) return fail(res, 400, "Statut non autorisé.");
+	  const changes: MeetingChanges = {};
+	  if ((before.roomName ?? null) !== (meeting.roomName ?? null)) changes.room = { from: before.roomName ?? null, to: meeting.roomName ?? null };
+	  if (before.comment !== meeting.comment) changes.comment = { from: before.comment, to: meeting.comment };
+	  if (Object.keys(changes).length) userscripts.dispatch("update-meeting", id, { role: s.role }, changes);
+	  if (req.body.status === "done") {
+		meeting = database.markMeetingDone(id);
+		userscripts.dispatch("valid-meeting", id, { role: s.role });
+	  }
 	  return res.json(meetingForRole(meeting, s.role));
 	} catch (e: any) { return fail(res, 400, e.message); }
   });
@@ -821,8 +834,73 @@ export function initApi(app: Express, database: Db): void {
 	  const s = session(req);
 	  if (s.role === "agent" && !database.listAssignationsForAgent(s.id).some((a: any) => a.id === (meeting.assignationId ?? meeting.assignation_id))) return fail(res, 403, "Réunion inaccessible.");
 	  if (s.role === "consumer" && !database.listAssignationsForConsumer(s.id).some((a: any) => a.id === (meeting.assignationId ?? meeting.assignation_id))) return fail(res, 403, "Réunion inaccessible.");
-	  return res.json(meetingForRole(database.cancelMeeting(id, s.role, s.id), s.role));
+	  const wasPending = meeting.status === "pending";
+	  const canceled = database.cancelMeeting(id, s.role, s.id);
+	  if (wasPending) userscripts.dispatch("cancel-meeting", id, { role: s.role });
+	  return res.json(meetingForRole(canceled, s.role));
 	} catch (e: any) { return fail(res, 400, e.message); }
+  });
+  // ---- Agent userscript (sandboxed JS run on meeting events, see USERSCRIPT_API.md) ----------------
+  const agentOnly = auth(["agent"]);
+  /** Secret values are write-only: only their names are sent back. */
+  const scriptView = (agentId: number) => {
+	const script = database.getAgentScript(agentId);
+	const { cpuTimeMs, wallTimeMs, memoryMb, maxRequests, requestTimeoutMs, maxResponseBytes } = DEFAULT_LIMITS;
+	return {
+	  code: script.code, enabled: script.enabled, updatedAt: script.updatedAt,
+	  secretNames: Object.keys(script.secrets).sort(),
+	  eventTypes: USERSCRIPT_EVENT_TYPES,
+	  limits: { cpuTimeMs, wallTimeMs, memoryMb, maxRequests, requestTimeoutMs, maxResponseBytes },
+	};
+  };
+  const eventTypeInput = (value: unknown): UserscriptEventType => {
+	if (!USERSCRIPT_EVENT_TYPES.includes(value as UserscriptEventType)) throw new Error(`type doit valoir ${USERSCRIPT_EVENT_TYPES.join(", ")}.`);
+	return value as UserscriptEventType;
+  };
+  const codeInput = (value: unknown): string => {
+	if (typeof value !== "string" || value.length > 100000) throw new Error("Le script doit être un texte de 100 000 caractères au maximum.");
+	return value;
+  };
+
+  app.get("/api/agent/script", agentOnly, (req, res) => {
+	try { return res.json(scriptView(session(req).id)); }
+	catch (e: any) { return fail(res, 400, e.message); }
+  });
+  app.put("/api/agent/script", agentOnly, (req, res) => {
+	try {
+	  const code = req.body.code === undefined ? undefined : codeInput(req.body.code);
+	  if (req.body.enabled !== undefined && typeof req.body.enabled !== "boolean") return fail(res, 400, "enabled doit être un booléen.");
+	  database.saveAgentScript(session(req).id, { code, enabled: req.body.enabled });
+	  return res.json(scriptView(session(req).id));
+	} catch (e: any) { return fail(res, 400, e.message || "Enregistrement impossible."); }
+  });
+  /** secrets: [{ name, value }] where value null removes the secret; other secrets are kept. */
+  app.patch("/api/agent/script/secrets", agentOnly, (req, res) => {
+	try {
+	  if (!Array.isArray(req.body.secrets) || req.body.secrets.length > 50) return fail(res, 400, "La liste des secrets est requise (50 au maximum).");
+	  const changes: Record<string, string | null> = {};
+	  for (const item of req.body.secrets) {
+		const name = requiredString(item?.name, "name", 64);
+		if (item.value !== null && typeof item.value !== "string") return fail(res, 400, "La valeur d’un secret doit être un texte (ou null pour le supprimer).");
+		changes[name] = item.value;
+	  }
+	  database.updateAgentScriptSecrets(session(req).id, changes);
+	  return res.json(scriptView(session(req).id));
+	} catch (e: any) { return fail(res, 400, e.message || "Enregistrement impossible."); }
+  });
+  /** Runs the given code (default: the saved one) on one of my meetings, or on a sample event when meetingId is empty. */
+  app.post("/api/agent/script/test", agentOnly, async (req, res) => {
+	try {
+	  const agentId = session(req).id;
+	  const type = eventTypeInput(req.body.type ?? "new-meeting");
+	  const code = req.body.code === undefined ? database.getAgentScript(agentId).code : codeInput(req.body.code);
+	  const meetingId = optionalId(req.body.meetingId, "meetingId");
+	  return res.json(await userscripts.test(agentId, type, code, meetingId));
+	} catch (e: any) { return fail(res, 400, e.message || "Test impossible."); }
+  });
+  app.get("/api/agent/script/runs", agentOnly, (req, res) => {
+	try { return res.json(database.listAgentScriptRuns(session(req).id)); }
+	catch (e: any) { return fail(res, 400, e.message); }
   });
 }
 

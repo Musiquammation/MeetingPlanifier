@@ -30,6 +30,7 @@
 				<li><a href="#agent-consumers" :aria-current="page === 'agent-consumers' ? 'page' : null">Consommateurs</a></li>
 				<li><a href="#agent-agenda" :aria-current="page === 'agent-agenda' ? 'page' : null">Agenda</a></li>
 				<li><a href="#agent-results" :aria-current="page === 'agent-results' ? 'page' : null">Résultats</a></li>
+				<li><a href="#agent-script" :aria-current="page === 'agent-script' ? 'page' : null">Script</a></li>
 			</ul>
 		</template>
 		<template x-if="role === 'consumer'">
@@ -649,6 +650,120 @@
 							</li>
 						</template>
 					</ul>
+				</div>
+			</template>
+		</section>
+	</template>
+
+	<!-- ============ Agent: userscript run on the server on each meeting event (see USERSCRIPT_API.md) ============ -->
+	<template x-if="page === 'agent-script'">
+		<section data-script>
+			<h1>Script</h1>
+			<p>Écrivez une fonction JavaScript <code>userscript(env, args)</code>. Elle est exécutée sur le serveur, dans un environnement isolé, à chaque événement de vos rendez-vous : nouveau rendez-vous, annulation, validation. Elle peut appeler vos propres services (<code>env.get</code>, <code>env.post</code>…) avec les clés rangées dans vos secrets.</p>
+			<template x-if="script">
+				<div>
+					<p data-tone="ok" x-show="script.enabled">Le script est <b>actif</b>.</p>
+					<p x-show="!script.enabled"><b>Le script est désactivé</b> : il ne s’exécute que lorsque vous le testez.</p>
+					<p><small x-text="'Limites : ' + script.limits.cpuTimeMs + ' ms de calcul, ' + (script.limits.wallTimeMs / 1000) + ' s au total, ' + script.limits.memoryMb + ' Mo de mémoire, ' + script.limits.maxRequests + ' requêtes HTTP par exécution. Les adresses internes (localhost, réseau privé) sont interdites.'"></small></p>
+
+					<h2>Secrets</h2>
+					<p>Les secrets sont propres à votre compte et accessibles dans <code>env.secrets.NOM</code>, pour ne pas écrire vos clés dans le code. Leur valeur n’est jamais réaffichée et elle est masquée dans le journal. Pour une clé JSON (compte de service Google), collez tout le contenu du fichier.</p>
+					<template x-if="script.secretNames.length">
+						<div role="region" tabindex="0" aria-label="Secrets">
+							<table>
+								<thead><tr><th>Nom</th><th>Valeur</th><th></th></tr></thead>
+								<tbody>
+									<template x-for="n in script.secretNames" :key="n">
+										<tr>
+											<td><code x-text="'env.secrets.' + n"></code></td>
+											<td>••••••••</td>
+											<td>
+												<button type="button" @click="secretForm.name = n; secretForm.value = ''; $nextTick(() => document.getElementById('secret-value')?.focus())" :disabled="busy">Remplacer</button>
+												<button type="button" data-variant="danger" @click="deleteSecret(n)" :disabled="busy">Supprimer</button>
+											</td>
+										</tr>
+									</template>
+								</tbody>
+							</table>
+						</div>
+					</template>
+					<template x-if="!script.secretNames.length"><p>Aucun secret pour l’instant.</p></template>
+					<form @submit.prevent="saveSecret()">
+						<label>Nom <small>Lettres, chiffres et _ (ex. API_KEY). Un nom existant est remplacé.</small>
+							<input x-model="secretForm.name" required maxlength="64" pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off" spellcheck="false">
+						</label>
+						<label>Valeur
+							<input id="secret-value" type="password" x-model="secretForm.value" maxlength="4096" autocomplete="new-password">
+						</label>
+						<button type="submit" :disabled="busy">Enregistrer le secret</button>
+					</form>
+
+					<h2>Code</h2>
+					<label for="script-code">Code du script <small x-show="scriptDirty()">(modifications non enregistrées)</small></label>
+					<textarea id="script-code" data-code x-model="scriptCode" spellcheck="false" autocapitalize="off" autocomplete="off" rows="22" maxlength="100000" @keydown.tab="scriptTab($event)"></textarea>
+					<p data-actions>
+						<button type="button" @click="saveScript()" :disabled="busy || !scriptDirty()">Enregistrer</button>
+						<template x-if="!script.enabled"><button type="button" @click="toggleScript(true)" :disabled="busy">Enregistrer et activer</button></template>
+						<template x-if="script.enabled"><button type="button" data-variant="danger" @click="toggleScript(false)" :disabled="busy">Désactiver</button></template>
+						<button type="button" @click="resetScriptTemplate()" :disabled="busy">Revenir à l’exemple</button>
+					</p>
+
+					<h2>Tester</h2>
+					<p>Le test exécute le code affiché (même non enregistré) avec vos secrets. Les requêtes HTTP sont réellement envoyées.</p>
+					<form @submit.prevent="testScript()" data-script-test>
+						<label>Événement
+							<select x-model="scriptTest.type">
+								<template x-for="t in script.eventTypes" :key="t"><option :value="t" x-text="scriptEventLabel(t)"></option></template>
+							</select>
+						</label>
+						<label>Rendez-vous
+							<select x-model="scriptTest.meetingId">
+								<option value="">Exemple fictif</option>
+								<template x-for="m in meetings" :key="m.id"><option :value="String(m.id)" x-text="meetingOptionLabel(m)"></option></template>
+							</select>
+						</label>
+						<button type="submit" :disabled="busy" x-text="busy ? 'Exécution…' : 'Lancer le test'"></button>
+					</form>
+					<template x-if="scriptTest.last">
+						<div data-run-output :data-status="scriptTest.last.status" role="status">
+							<p><b x-text="runStatusLabel(scriptTest.last.status)"></b> en <span x-text="scriptTest.last.durationMs"></span> ms</p>
+							<template x-if="scriptTest.last.error"><pre x-text="scriptTest.last.error"></pre></template>
+							<template x-if="scriptTest.last.logs.length"><div><h3>Journal (env.log)</h3><pre x-text="scriptTest.last.logs.join('\n')"></pre></div></template>
+							<template x-if="scriptTest.last.result !== null"><div><h3>Valeur renvoyée</h3><pre x-text="scriptTest.last.result"></pre></div></template>
+						</div>
+					</template>
+
+					<h2>Dernières exécutions</h2>
+					<p data-actions><button type="button" @click="refreshScriptRuns()" :disabled="loading">Actualiser</button></p>
+					<template x-if="!scriptRuns.length"><p>Aucune exécution pour l’instant.</p></template>
+					<template x-if="scriptRuns.length">
+						<div role="region" tabindex="0" aria-label="Dernières exécutions">
+							<table>
+								<thead><tr><th>Date</th><th>Événement</th><th>Origine</th><th>Résultat</th><th>Durée</th><th></th></tr></thead>
+								<tbody>
+									<template x-for="r in scriptRuns" :key="r.id">
+										<tr>
+											<td x-text="fmt(r.createdAt)"></td>
+											<td x-text="scriptEventLabel(r.eventType) + (r.meetingId ? ' (n° ' + r.meetingId + ')' : '')"></td>
+											<td x-text="r.trigger === 'test' ? 'Test' : 'Automatique'"></td>
+											<td x-text="runStatusLabel(r.status)"></td>
+											<td x-text="r.durationMs + ' ms'"></td>
+											<td><button type="button" @click="openRun = openRun === r.id ? null : r.id" :aria-expanded="openRun === r.id" x-text="openRun === r.id ? 'Masquer' : 'Détails'"></button></td>
+										</tr>
+									</template>
+								</tbody>
+							</table>
+						</div>
+					</template>
+					<template x-for="r in scriptRuns.filter(x => x.id === openRun)" :key="r.id">
+						<div data-run-output :data-status="r.status">
+							<p><b x-text="runStatusLabel(r.status)"></b> · <span x-text="fmt(r.createdAt)"></span></p>
+							<template x-if="r.error"><pre x-text="r.error"></pre></template>
+							<template x-if="r.logs.length"><div><h3>Journal (env.log)</h3><pre x-text="r.logs.join('\n')"></pre></div></template>
+							<template x-if="r.result !== null"><div><h3>Valeur renvoyée</h3><pre x-text="r.result"></pre></div></template>
+							<template x-if="!r.error && !r.logs.length && r.result === null"><p>Aucune sortie.</p></template>
+						</div>
+					</template>
 				</div>
 			</template>
 		</section>
