@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "client": "vite",
+    "bundle": "vite build --mode bundle",
+    "build": "vite build",
     "server": "tsx --tsconfig tsconfig.server.json server/server.ts",
     "seed": "tsx --tsconfig tsconfig.server.json server/seed.ts"
   },
