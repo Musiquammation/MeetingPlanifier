@@ -377,6 +377,7 @@ CREATE TABLE IF NOT EXISTS assignations (
   agent_id INTEGER NOT NULL,
   fidelity_id INTEGER NOT NULL,
   package_id INTEGER,
+  intercourse_minutes INTEGER NOT NULL DEFAULT 0 CHECK (intercourse_minutes >= 0 AND intercourse_minutes <= 1440),
   created_at TEXT NOT NULL,
   UNIQUE (agent_id, fidelity_id),
   FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE RESTRICT,
@@ -385,6 +386,19 @@ CREATE TABLE IF NOT EXISTS assignations (
 );
 CREATE INDEX IF NOT EXISTS idx_assignations_agent ON assignations(agent_id);
 CREATE INDEX IF NOT EXISTS idx_assignations_fidelity ON assignations(fidelity_id);
+
+-- Intercourse ("intercours") chosen by an agent for a pair of his consumers; it replaces the default
+-- max(intercourse of A, intercourse of B). The pair is unordered: assignation_a < assignation_b.
+CREATE TABLE IF NOT EXISTS intercourse_pairs (
+  assignation_a INTEGER NOT NULL,
+  assignation_b INTEGER NOT NULL,
+  minutes INTEGER NOT NULL CHECK (minutes >= 0 AND minutes <= 1440),
+  PRIMARY KEY (assignation_a, assignation_b),
+  CHECK (assignation_a < assignation_b),
+  FOREIGN KEY (assignation_a) REFERENCES assignations(id) ON DELETE CASCADE,
+  FOREIGN KEY (assignation_b) REFERENCES assignations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_intercourse_pairs_b ON intercourse_pairs(assignation_b);
 
 CREATE TABLE IF NOT EXISTS rooms (
   company_id INTEGER NOT NULL,
@@ -577,6 +591,9 @@ END;
   }
   if (!hasColumn("assignations", "package_id")) {
     this.connection.exec("ALTER TABLE assignations ADD COLUMN package_id INTEGER REFERENCES packages(id) ON DELETE RESTRICT");
+  }
+  if (!hasColumn("assignations", "intercourse_minutes")) {
+    this.connection.exec("ALTER TABLE assignations ADD COLUMN intercourse_minutes INTEGER NOT NULL DEFAULT 0 CHECK (intercourse_minutes >= 0 AND intercourse_minutes <= 1440)");
   }
   if (!hasColumn("meetings", "hourly_rate")) {
     this.connection.exec("ALTER TABLE meetings ADD COLUMN hourly_rate REAL NOT NULL DEFAULT 0 CHECK (hourly_rate >= 0)");
@@ -1123,10 +1140,12 @@ END;
   companyId: number;
   companyName: string;
   createdAt: string;
+  /** Minutes the agent needs between a meeting of this consumer and the next/previous one (default 0). */
+  intercourseMinutes: number;
   consumer: Pick<Consumer, "id" | "name" | "surname" | "username">;
   }> {
   const rows = this.connection.prepare(
-    `SELECT a.id, a.agent_id, a.fidelity_id, a.created_at, f.company_id, c.name AS company_name,
+    `SELECT a.id, a.agent_id, a.fidelity_id, a.created_at, a.intercourse_minutes, f.company_id, c.name AS company_name,
         co.id AS consumer_id, co.name AS consumer_name, co.surname AS consumer_surname, co.username AS consumer_username
      FROM assignations a
      JOIN fidelities f ON f.id = a.fidelity_id AND f.active = 1
@@ -1137,6 +1156,7 @@ END;
   ).all(agentId) as RawRow[];
   return rows.map((row) => ({
     id: Number(row.id), agentId: Number(row.agent_id), fidelityId: Number(row.fidelity_id), createdAt: String(row.created_at),
+    intercourseMinutes: Number(row.intercourse_minutes ?? 0),
     companyId: Number(row.company_id), companyName: String(row.company_name),
     consumer: { id: Number(row.consumer_id), name: String(row.consumer_name), surname: String(row.consumer_surname), username: String(row.consumer_username) },
   }));
@@ -1471,6 +1491,57 @@ END;
   });
   }
 
+  // ---- Intercourse (time the agent needs between two meetings, e.g. to travel) ----------------
+
+  /** Default intercourse of one consumer, as chosen by his agent. */
+  setAssignationIntercourse(assignationId: number, minutes: number): void {
+  this.assertIntercourse(minutes);
+  const result = this.connection.prepare("UPDATE assignations SET intercourse_minutes = ? WHERE id = ?").run(minutes, assignationId);
+  if (result.changes === 0) throw new Error("Assignation not found");
+  }
+
+  /** Intercourse of a pair of consumers (order does not matter); null removes it (back to the default). */
+  setIntercoursePair(assignationA: number, assignationB: number, minutes: number | null): void {
+  if (assignationA === assignationB) throw new Error("An intercourse pair needs two different consumers");
+  const [a, b] = assignationA < assignationB ? [assignationA, assignationB] : [assignationB, assignationA];
+  if (minutes === null) {
+    this.connection.prepare("DELETE FROM intercourse_pairs WHERE assignation_a = ? AND assignation_b = ?").run(a, b);
+    return;
+  }
+  this.assertIntercourse(minutes);
+  this.connection.prepare(
+    `INSERT INTO intercourse_pairs (assignation_a, assignation_b, minutes) VALUES (?, ?, ?)
+     ON CONFLICT (assignation_a, assignation_b) DO UPDATE SET minutes = excluded.minutes`,
+  ).run(a, b, minutes);
+  }
+
+  /** Pair intercourses between the consumers of an agent. */
+  listIntercoursePairsForAgent(agentId: number): Array<{ assignationA: number; assignationB: number; minutes: number }> {
+  const rows = this.connection.prepare(
+    `SELECT p.assignation_a, p.assignation_b, p.minutes FROM intercourse_pairs p
+     JOIN assignations a ON a.id = p.assignation_a
+     WHERE a.agent_id = ?`,
+  ).all(agentId) as RawRow[];
+  return rows.map((row) => ({ assignationA: Number(row.assignation_a), assignationB: Number(row.assignation_b), minutes: Number(row.minutes) }));
+  }
+
+  /** Minutes required between meetings of two assignations: the pair value, else max of both defaults. */
+  requiredIntercourse(assignationA: number, assignationB: number): number {
+  if (assignationA !== assignationB) {
+    const [a, b] = assignationA < assignationB ? [assignationA, assignationB] : [assignationB, assignationA];
+    const pair = this.connection.prepare("SELECT minutes FROM intercourse_pairs WHERE assignation_a = ? AND assignation_b = ?").get(a, b) as RawRow | undefined;
+    if (pair) return Number(pair.minutes);
+  }
+  const row = this.connection.prepare(
+    "SELECT MAX(intercourse_minutes) AS m FROM assignations WHERE id IN (?, ?)",
+  ).get(assignationA, assignationB) as RawRow | undefined;
+  return Number(row?.m ?? 0);
+  }
+
+  private assertIntercourse(minutes: number): void {
+  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 1440) throw new Error("Intercourse must be an integer between 0 and 1440 minutes");
+  }
+
   /** Hourly rate that applies to an assignation: its own package, else the consumer's default package, else 0. */
   resolveHourlyRate(assignationId: number): number {
   const row = this.connection.prepare(
@@ -1620,25 +1691,23 @@ END;
   }
 
   /**
-   * Change the number of hours of a request whenever the consumer wants (a very large value means "no limit").
-   * The new total can never be below the hours already scheduled; the request is reopened or marked
-   * fulfilled according to the hours that remain. A closed request stays closed.
+   * Change the number of hours the consumer still wants, whenever he wants (a very large value means "no limit").
+   * The hours given are the hours left to schedule: meetings already booked (pending or done) are not counted
+   * against them. Internally the request keeps its total (remaining + booked), so that booking a meeting lowers the
+   * remaining hours and cancelling one gives them back. A closed request stays closed.
    */
-  updateAvailabilityRequestHours(id: number, requestedHours: number): AvailabilityRequestProgress {
-  if (!Number.isFinite(requestedHours) || requestedHours <= 0 || requestedHours > 24 * 366) {
+  updateAvailabilityRequestHours(id: number, remainingHours: number): AvailabilityRequestProgress {
+  if (!Number.isFinite(remainingHours) || remainingHours <= 0 || remainingHours > 24 * 366) {
     throw new Error("Requested hours must be greater than 0 and at most 8784");
   }
-  const requestedMinutes = Math.round(requestedHours * 60);
-  if (requestedMinutes <= 0) throw new Error("Requested hours must equal at least one minute");
+  const remainingMinutes = Math.round(remainingHours * 60);
+  if (remainingMinutes <= 0) throw new Error("Requested hours must equal at least one minute");
   return this.withTransaction(() => {
     const progress = this.getAvailabilityRequestProgress(id);
     if (!progress) throw new Error("Availability request not found");
-    if (requestedMinutes < progress.scheduledMinutes) {
-    throw new Error(`Requested hours cannot be below the ${Math.round(progress.scheduledMinutes / 6) / 10} h already scheduled`);
-    }
-    const remaining = requestedMinutes - progress.scheduledMinutes;
+    const requestedMinutes = remainingMinutes + progress.scheduledMinutes;
     let status: AvailabilityRequestStatus = progress.status;
-    if (status !== "closed") status = remaining > 0 ? "open" : "fulfilled";
+    if (status !== "closed") status = "open";
     this.connection.prepare("UPDATE availability_requests SET requested_minutes = ?, status = ?, updated_at = ? WHERE id = ?")
     .run(requestedMinutes, status, this.nowIso(), id);
     return this.getAvailabilityRequestProgress(id)!;
@@ -2061,6 +2130,24 @@ END;
      LIMIT 1`,
     ).get(Number(dispoRow.agent_id), Number(dispoRow.consumer_id), endAt, startAt) as RawRow | undefined;
     if (conflictingMeeting) throw new Error("The agent or consumer already has a meeting during this interval");
+
+    // Intercourse: the agent needs some time between two of his meetings (travel...).
+    const neighbours = this.connection.prepare(
+    `SELECT m.id, m.assignation_id, m.start_at, m.duration_minutes FROM meetings m
+     JOIN assignations ma ON ma.id = m.assignation_id
+     WHERE m.status <> 'canceledBy' AND ma.agent_id = ?
+       AND julianday(m.start_at) < julianday(?, '+1440 minutes')
+       AND julianday(m.start_at, '+' || m.duration_minutes || ' minutes') > julianday(?, '-1440 minutes')`,
+    ).all(Number(dispoRow.agent_id), endAt, startAt) as RawRow[];
+    for (const other of neighbours) {
+    const gap = this.requiredIntercourse(input.assignationId, Number(other.assignation_id));
+    if (gap <= 0) continue;
+    const otherStart = Date.parse(String(other.start_at));
+    const otherEnd = otherStart + Number(other.duration_minutes) * 60000;
+    if (otherStart < Date.parse(endAt) + gap * 60000 && otherEnd + gap * 60000 > Date.parse(startAt)) {
+      throw new Error(`Intercours non respecté : il faut au moins ${gap} min entre ce rendez-vous et un autre rendez-vous déjà fixé.`);
+    }
+    }
 
     let roomCompanyId: number | null = null;
     let roomName: string | null = null;

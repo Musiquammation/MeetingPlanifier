@@ -22,6 +22,8 @@ function camelize(value: any): any {
 	return value;
 }
 
+import type { IntercoursePair } from "./types";
+
 type Query = Record<string, string | number | boolean | null | undefined>;
 
 export class Fetcher {
@@ -138,6 +140,13 @@ export class Fetcher {
 	deleteDispo(id: number) { return this.del(`/api/disponibilities/${id}`); }
 
 	myConsumers() { return this.get<any[]>("/api/my-consumers"); }
+	/** Intercourse ("intercours"): minutes the agent needs between two meetings (default of one consumer, or of a pair). */
+	setIntercourse(assignationId: number, intercourseMinutes: number) { return this.patch(`/api/my-consumers/${assignationId}`, { intercourseMinutes }); }
+	intercoursePairs() { return this.get<IntercoursePair[]>("/api/intercourse-pairs"); }
+	/** minutes null removes the pair value (back to max of both defaults). */
+	setIntercoursePair(assignationA: number, assignationB: number, minutes: number | null) {
+		return this.request<IntercoursePair[]>("PUT", "/api/intercourse-pairs", { body: { assignationA, assignationB, minutes } });
+	}
 
 	suggestions(q: { from?: string; to?: string }) { return this.get<any[]>("/api/suggestions", q); }
 	createSuggestion(b: { contractId: number; startAt: string; durationMinutes: number; love: number }) { return this.post("/api/suggestions", b); }

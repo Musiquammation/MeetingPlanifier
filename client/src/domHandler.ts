@@ -6,7 +6,8 @@ import Alpine from "alpinejs";
 import { Calendar, addDays, toLocalInput, type CalEvent, type EventKind } from "./Calendar";
 import { ResultsView } from "./Results";
 import { fetcher } from "./fetcher";
-import type { AvailabilityRequest, Company, Meeting, Package, Page, Role, Room } from "./types";
+import { plan } from "./Planner";
+import type { AvailabilityRequest, Company, IntercoursePair, Meeting, Package, Page, Proposal, Role, Room } from "./types";
 
 /** Required role per page (null = public page). */
 const PAGES: Record<Page, Role | null> = {
@@ -26,14 +27,18 @@ const ALL_TO = "2100-01-01T00:00:00.000Z";
 const DEFAULT_SOCIETY_RATE = 28;
 const HOME: Record<Role, Page> = { admin: "admin-dashboard", agent: "agent-dashboard", consumer: "consumer-dashboard" };
 const STATUS: Record<string, string> = { pending: "En attente", done: "Terminé", canceledBy: "Annulé" };
-const KIND: Record<EventKind, string> = { meeting: "Rendez-vous", dispo: "Disponibilité", suggestion: "Suggestion", slot: "Créneau de l’agent" };
+const KIND: Record<EventKind, string> = { meeting: "Rendez-vous", dispo: "Disponibilité", suggestion: "Suggestion", slot: "Créneau de l’agent", proposal: "Proposition" };
 
 /** The server reports minutes; the UI works in hours. */
 const normRequest = (r: any): AvailabilityRequest => ({
 	...r,
 	requestedHours: r.requestedHours ?? Math.round((r.requestedMinutes ?? 0) / 6) / 10,
-	scheduledHours: r.scheduledHours ?? Math.round((r.scheduledMinutes ?? 0) / 6) / 10
+	scheduledHours: r.scheduledHours ?? Math.round((r.scheduledMinutes ?? 0) / 6) / 10,
+	remainingHours: r.remainingHours ?? (r.remainingMinutes != null ? Math.round(r.remainingMinutes / 6) / 10 : undefined)
 });
+/** Hours a request still asks for (meetings already booked are not counted). */
+const remainingOf = (r: AvailabilityRequest): number =>
+	r.remainingHours ?? Math.max(0, Math.round((r.requestedHours - (r.scheduledHours ?? 0)) * 10) / 10);
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
 const horizon = (days: number) => ({ from: new Date().toISOString(), to: addDays(new Date(), days).toISOString() });
@@ -83,6 +88,12 @@ export class DomHandler {
 	res = new ResultsView();
 	// Agent agenda: only show the consumers who still ask for hours
 	onlyRequesters = false;
+	// Intercourse ("intercours"): pair values of the agent, and the consumer whose pair values are displayed
+	intercoursePairs: IntercoursePair[] = [];
+	openIntercourse: number | null = null;
+	// Agent agenda: meetings proposed by the optimizer, kept in memory until validated or erased
+	proposals: Proposal[] = [];
+	planForm = { maxMinutes: 120 }; // longest proposed meeting (default 2 h)
 
 	cal = new Calendar();
 
@@ -144,6 +155,7 @@ export class DomHandler {
 		this.cal.events = [];
 		this.packages = []; this.roomMeetings = []; this.res.clear(); this.roomCal.events = [];
 		this.onlyRequesters = false;
+		this.intercoursePairs = []; this.openIntercourse = null; this.proposals = []; this.cal.gaps = [];
 	}
 
 	async logout(): Promise<void> {
@@ -257,7 +269,8 @@ export class DomHandler {
 					this.res.setData("agent", a.meetings ?? [], a.assignations ?? []);
 				});
 			case "agent-consumers":
-				return this.load(async () => { this.assignations = await fetcher.myConsumers(); });
+				this.openIntercourse = null;
+				return this.load(async () => { [this.assignations, this.intercoursePairs] = await Promise.all([fetcher.myConsumers(), fetcher.intercoursePairs()]); });
 			case "agent-dashboard":
 				return this.load(async () => {
 					const a = await fetcher.agenda(from, to);
@@ -344,7 +357,28 @@ export class DomHandler {
 	/** An implicit request (hours not stated by the consumer) is created with this many hours. */
 	isUnlimited(r: AvailabilityRequest): boolean { return r.requestedHours >= 1000; }
 	progress(r: AvailabilityRequest): string {
-		return this.isUnlimited(r) ? `${r.scheduledHours ?? 0} h planifiées (sans limite d’heures)` : `${r.scheduledHours ?? 0} / ${r.requestedHours} h planifiées`;
+		const booked = `${r.scheduledHours ?? 0} h déjà planifiées`;
+		return this.isUnlimited(r) ? `sans limite d’heures (${booked})` : `encore ${remainingOf(r)} h souhaitées (${booked})`;
+	}
+	remainingHours(r: AvailabilityRequest): number { return remainingOf(r); }
+	/**
+	 * Agent agenda: hours each consumer still wants (open requests), meetings already booked not counted.
+	 * `unlimited` when one of his open requests has no limit.
+	 */
+	consumerHours(assignationId: number): { remaining: number; scheduled: number; unlimited: boolean } {
+		const mine = this.requests.filter((r) => r.assignationId === assignationId);
+		const open = mine.filter((r) => (r.status ?? "open") !== "closed");
+		const round = (n: number) => Math.round(n * 10) / 10;
+		return {
+			remaining: round(open.filter((r) => !this.isUnlimited(r)).reduce((t, r) => t + remainingOf(r), 0)),
+			scheduled: round(mine.reduce((t, r) => t + (r.scheduledHours ?? 0), 0)),
+			unlimited: open.some((r) => this.isUnlimited(r))
+		};
+	}
+	consumerHoursLabel(assignationId: number): string {
+		const h = this.consumerHours(assignationId);
+		if (h.unlimited) return "sans limite";
+		return h.remaining > 0 ? `${h.remaining} h` : "aucune";
 	}
 	upcoming(): Meeting[] {
 		return this.meetings.filter((m) => m.status === "pending").sort((a, b) => Date.parse(a.startAt) - Date.parse(b.startAt));
@@ -361,7 +395,7 @@ export class DomHandler {
 	contractLabel(c: any): string { return c.companyName ?? c.company?.name ?? `Société n° ${c.companyId}`; }
 	currentRequest(): AvailabilityRequest | undefined {
 		const mine = this.requests.filter((r) => r.assignationId === this.selAssign);
-		return mine.find((r) => (r.scheduledHours ?? 0) < r.requestedHours) ?? mine[0];
+		return mine.find((r) => remainingOf(r) > 0) ?? mine[0];
 	}
 
 	// ---- Admin helpers: who, rooms and prices -------------------------------
@@ -740,7 +774,7 @@ export class DomHandler {
 
 	// ---- Agenda (agent and consumer) -------------------------------------
 	async openAgenda(): Promise<void> {
-		this.cal.onSelect = (s, e) => this.beginInterval(s, e);
+		this.cal.onSelect = (s, e, origin) => this.beginInterval(s, e, origin);
 		this.cal.selection = null;
 		this.cal.attach(() => void this.refreshAgenda());
 		await this.refreshAgenda();
@@ -754,6 +788,7 @@ export class DomHandler {
 			if (this.role === "agent") {
 				this.contracts = a.contracts ?? []; this.assignations = a.assignations ?? []; this.suggestions = a.suggestions ?? [];
 				this.requests = (a.requests ?? []).map(normRequest); // used by the "Demandeurs" filter
+				this.intercoursePairs = a.intercoursePairs ?? [];
 				[this.dispos, this.rooms] = await Promise.all([fetcher.disponibilities({ from, to }), fetcher.rooms()]);
 			} else {
 				this.agentsList = a.agents ?? []; this.requests = (a.requests ?? []).map(normRequest); this.slots = a.agentSlots ?? []; // the agent's hours, independent of my availabilities
@@ -779,6 +814,7 @@ export class DomHandler {
 		const span = (x: any) => ({ s: Date.parse(x.startAt), e: Date.parse(x.startAt) + x.durationMinutes * 60000 });
 		// Cancelled meetings are not drawn in the calendar: they are listed in their own section
 		const meetings = this.meetings.filter((m) => m.status !== "canceledBy");
+		this.cal.gaps = this.role === "agent" ? this.buildGaps(meetings) : [];
 		const busy = meetings.map(span).sort((a, b) => a.s - b.s);
 		const mk = (kind: EventKind, x: any, title: string, editable = false, status?: string, s = span(x).s, e = span(x).e): CalEvent => ({
 			id: `${kind}-${x.id}-${s}`, kind, title, status, editable, love: x.love, raw: x, start: new Date(s), end: new Date(e)
@@ -798,6 +834,9 @@ export class DomHandler {
 		const agent = this.role === "agent";
 		for (const m of meetings) out.push(mk("meeting", m, agent ? this.who(m.assignationId) : this.agentOf(m.assignationId), false, m.status));
 		if (agent) {
+			for (const p of this.proposals) {
+				out.push({ id: p.id, kind: "proposal", title: this.who(p.assignationId), raw: p, start: p.start, end: p.end });
+			}
 			for (const s of this.suggestions) out.push(...cut("suggestion", s, "Mes horaires", true));
 			for (const d of this.dispos) if (this.isVisible(d.assignationId)) out.push(...cut("dispo", d, this.who(d.assignationId)));
 		} else {
@@ -811,6 +850,134 @@ export class DomHandler {
 		return out;
 	}
 
+
+	// ---- Intercourse ("intercours": time the agent needs between two meetings) ----------------
+	/** Default intercourse of a consumer (minutes). */
+	intercourseOf(assignationId: number): number { return this.assignations.find((x) => x.id === assignationId)?.intercourseMinutes ?? 0; }
+	/** Value chosen for a pair of consumers (order does not matter), or null. */
+	pairIntercourse(a: number, b: number): number | null {
+		const p = this.intercoursePairs.find((x) => (x.assignationA === a && x.assignationB === b) || (x.assignationA === b && x.assignationB === a));
+		return p ? p.minutes : null;
+	}
+	/** Minutes required between meetings of two consumers: the pair value, else the larger default. */
+	gap(a: number, b: number): number {
+		return (a !== b ? this.pairIntercourse(a, b) : null) ?? Math.max(this.intercourseOf(a), this.intercourseOf(b));
+	}
+	toggleIntercourse(x: any) { this.openIntercourse = this.openIntercourse === x.id ? null : x.id; }
+
+	private intercourseInput(value: string): number {
+		const n = Number(String(value).trim());
+		if (!Number.isInteger(n) || n < 0 || n > 1440) throw new Error("L’intercours est un nombre entier de minutes entre 0 et 1440.");
+		return n;
+	}
+
+	async saveIntercourse(x: any, value: string) {
+		await this.run(async () => {
+			await fetcher.setIntercourse(x.id, this.intercourseInput(value || "0"));
+			this.assignations = await fetcher.myConsumers();
+		}, `Intercours de ${this.consumerLabel(x)} enregistré.`);
+	}
+
+	/** Empty value: the pair goes back to the default (the larger intercourse of both consumers). */
+	async savePairIntercourse(x: any, y: any, value: string) {
+		await this.run(async () => {
+			this.intercoursePairs = await fetcher.setIntercoursePair(x.id, y.id, String(value).trim() === "" ? null : this.intercourseInput(value));
+		}, `Intercours entre ${this.consumerLabel(x)} et ${this.consumerLabel(y)} enregistré.`);
+	}
+
+	/** Greyed bands after each meeting (or proposal) followed by another one the same day: the intercourse to keep. */
+	private buildGaps(meetings: Meeting[]): CalEvent[] {
+		const items = [
+			...meetings.map((m) => ({ a: m.assignationId, s: Date.parse(m.startAt), e: Date.parse(m.startAt) + m.durationMinutes * 60000 })),
+			...this.proposals.map((p) => ({ a: p.assignationId, s: p.start.getTime(), e: p.end.getTime() }))
+		].sort((x, y) => x.s - y.s);
+		const out: CalEvent[] = [];
+		for (let i = 0; i + 1 < items.length; i++) {
+			const cur = items[i], next = items[i + 1];
+			if (new Date(cur.e).toDateString() !== new Date(next.s).toDateString()) continue;
+			const g = this.gap(cur.a, next.a);
+			if (g <= 0) continue;
+			out.push({
+				id: `gap-${cur.s}-${next.s}`, kind: "meeting", title: `Intercours ${g} min`, raw: null,
+				status: next.s < cur.e + g * 60000 ? "short" : undefined, // the next meeting starts too early
+				start: new Date(cur.e), end: new Date(cur.e + g * 60000)
+			});
+		}
+		return out;
+	}
+
+	// ---- Agent: automatic proposals (client side only, nothing is saved until validated) ----------
+	/**
+	 * Proposes one meeting per consumer (shown in the filter), lasting min(maximum length, hours he still asks for),
+	 * placed so that it suits the most consumers over the visible period.
+	 */
+	proposeMeetings() {
+		const maxMinutes = Number(this.planForm.maxMinutes);
+		if (!Number.isInteger(maxMinutes) || maxMinutes < 15 || maxMinutes % 15) { this.error = "La durée maximale est un multiple de 15 minutes."; return; }
+		const { from, to } = this.cal.range;
+		const remaining = new Map<number, number>();
+		for (const r of this.requests) {
+			if ((r.status ?? "open") !== "open") remaining.set(r.id, 0);
+			else remaining.set(r.id, r.remainingMinutes ?? Math.round((r.requestedHours - (r.scheduledHours ?? 0)) * 60));
+		}
+		this.proposals = plan({
+			from: Date.parse(from), to: Date.parse(to), now: Date.now(), maxMinutes,
+			dispos: this.dispos.filter((d) => this.isVisible(d.assignationId)),
+			suggestions: this.suggestions, contracts: this.contracts, assignations: this.assignations, remaining,
+			meetings: this.meetings.filter((m) => m.status !== "canceledBy"),
+			gap: (a, b) => this.gap(a, b)
+		});
+		this.closePanel();
+		this.cal.events = this.buildEvents();
+		const n = this.proposals.length;
+		const people = new Set(this.proposals.map((p) => p.assignationId)).size;
+		if (n) { this.error = ""; this.notice = `${n} proposition${n > 1 ? "s" : ""} pour ${people} consommateur${people > 1 ? "s" : ""}. Rien n’est enregistré tant que vous ne validez pas.`; }
+		else { this.notice = ""; this.error = "Aucune proposition possible sur cette période (disponibilités, horaires, heures demandées ou intercours)."; }
+	}
+
+	private async bookProposal(p: Proposal): Promise<void> {
+		await fetcher.createMeeting({
+			assignationId: p.assignationId, startAt: p.start.toISOString(), durationMinutes: Math.round((p.end.getTime() - p.start.getTime()) / 60000),
+			roomName: null, comment: "", idempotencyKey: `${p.id}-${uid()}`
+		});
+		this.proposals = this.proposals.filter((x) => x.id !== p.id);
+	}
+
+	async validateProposal() {
+		const p: Proposal = this.panel.ev.raw;
+		await this.run(async () => {
+			await this.bookProposal(p);
+			this.closePanel();
+			await this.refreshAgenda();
+		}, "Rendez-vous créé.");
+	}
+
+	eraseProposal() {
+		const p: Proposal = this.panel.ev.raw;
+		this.proposals = this.proposals.filter((x) => x.id !== p.id);
+		this.closePanel();
+		this.cal.events = this.buildEvents();
+	}
+
+	clearProposals() {
+		this.proposals = [];
+		if (this.panel?.type === "proposal") this.closePanel();
+		this.cal.events = this.buildEvents();
+	}
+
+	/** Books every proposal; the ones the server refuses stay displayed. */
+	async validateAllProposals() {
+		if (!confirm(`Créer les ${this.proposals.length} rendez-vous proposés ?`)) return;
+		const failed: string[] = [];
+		await this.run(async () => {
+			for (const p of [...this.proposals]) {
+				try { await this.bookProposal(p); } catch (e: any) { failed.push(`${this.who(p.assignationId)} (${this.fmt(p.start.toISOString())}) : ${e?.message ?? "refusé"}`); }
+			}
+			if (this.panel?.type === "proposal") this.closePanel();
+			await this.refreshAgenda();
+			if (failed.length) throw new Error(`Non créés : ${failed.join(" · ")}`);
+		}, "Tous les rendez-vous proposés ont été créés.");
+	}
 
 	/** Move an editable availability/suggestion by dropping it at a new date/time. */
 	async dropEvent(e: DragEvent, day: Date) {
@@ -885,8 +1052,10 @@ export class DomHandler {
 		this.beginInterval(s, new Date(s.getTime() + 3600000));
 	}
 
-	beginInterval(start: Date, end: Date) {
+	/** A slot was drawn: the agent books a meeting when the gesture started on an availability, else adds his hours. */
+	beginInterval(start: Date, end: Date, origin: CalEvent | null = null) {
 		if (end.getTime() <= Date.now()) { this.cal.selection = null; this.error = "Ce créneau est déjà passé."; return; }
+		if (this.role === "agent" && origin?.kind === "dispo") { this.error = ""; void this.openBook(origin, start, end); return; }
 		if (this.role === "consumer" && this.selAssign === null) {
 			this.cal.selection = null;
 			this.error = "Aucun agent ne vous est assigné.";
@@ -904,6 +1073,7 @@ export class DomHandler {
 		this.error = "";
 		if (ev.kind === "meeting") return this.openMeeting(ev.raw);
 		if (ev.kind === "slot") { this.panel = { type: "slot", ev, error: "" }; return; }
+		if (ev.kind === "proposal") { this.panel = { type: "proposal", ev, error: "" }; return; }
 		if (ev.kind === "dispo" && this.role === "agent") return void this.openBook(ev);
 		this.panel = { // editing one of my own intervals
 			type: "interval", error: "",
@@ -949,14 +1119,17 @@ export class DomHandler {
 	}
 
 	// ---- Agent: book a meeting inside a consumer availability ---------------
-	/** The meeting starts at the clicked quarter hour (or at the start of the availability when clicked elsewhere). */
-	private async openBook(ev: CalEvent) {
+	/**
+	 * The meeting starts at the clicked quarter hour (or at the start of the availability when clicked elsewhere).
+	 * When a slot was drawn from the availability, the meeting takes exactly that slot.
+	 */
+	private async openBook(ev: CalEvent, from?: Date, to?: Date) {
 		const at = this.cal.lastPoint?.getTime() ?? 0;
-		const start = at >= ev.start.getTime() && at < ev.end.getTime() ? new Date(at) : ev.start;
-		const minutes = Math.round((ev.end.getTime() - start.getTime()) / 60000);
+		const start = from ?? (at >= ev.start.getTime() && at < ev.end.getTime() ? new Date(at) : ev.start);
+		const minutes = to ? Math.round((to.getTime() - start.getTime()) / 60000) : Math.min(60, Math.round((ev.end.getTime() - start.getTime()) / 60000));
 		this.panel = {
 			type: "book", ev, error: "", key: uid(), rooms: [] as Room[],
-			form: { assignationId: ev.raw.assignationId, start: toLocalInput(start), duration: Math.min(60, minutes), roomName: "", comment: "" }
+			form: { assignationId: ev.raw.assignationId, start: toLocalInput(start), duration: minutes, roomName: "", comment: "" }
 		};
 		await this.checkRooms();
 	}

@@ -827,3 +827,51 @@ ol[data-sorts] button { min-width: 2.75rem; padding: 0.4rem 0.6rem; }
 
 [data-results] td input { min-width: 11rem; }
 [data-row-actions] { display: inline-flex; flex-wrap: wrap; gap: 0.25rem; }
+
+/* ---- Intercourse and automatic proposals (agent) -------------------------- */
+
+/* Greyed band after a meeting: the time the agent needs before the next one (behind the events, never clickable) */
+[data-gap] {
+	position: absolute;
+	z-index: 0;
+	left: 0;
+	right: 0;
+	pointer-events: none;
+	top: calc(var(--start, 0) / 60 * var(--hour));
+	height: calc(var(--dur, 0) / 60 * var(--hour));
+	overflow: hidden;
+	padding: 0 0.35rem;
+	font-size: 0.65rem;
+	color: var(--muted);
+	background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--muted) 22%, transparent) 0 4px, color-mix(in srgb, var(--muted) 10%, transparent) 4px 8px);
+}
+[data-gap][data-status="short"] { background: color-mix(in srgb, var(--brick) 25%, transparent); color: var(--brick); }
+[data-legend] i[data-gap] { position: static; background: color-mix(in srgb, var(--muted) 30%, transparent); }
+
+[data-kind="proposal"] {
+	background: color-mix(in srgb, var(--brick) 18%, var(--surface));
+	border: 2px dashed var(--brick);
+	color: var(--brick);
+}
+[data-kind="proposal"][data-event] { z-index: 2; }
+
+form[data-propose] {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-end;
+	gap: 0.5rem 1rem;
+	margin: 0 0 0.75rem;
+}
+form[data-propose] label { flex: 0 1 12rem; }
+form[data-propose] small { flex: 1 1 100%; color: var(--muted); }
+
+td input[type="number"] { width: 6rem; }
+[data-intercourse] ul { list-style: none; padding: 0; display: grid; gap: 0.5rem; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); }
+
+/* Agent agenda: hours still wanted by each consumer */
+[data-consumer-hours] { margin: 1rem 0 0.75rem; }
+[data-consumer-hours] h2 { margin: 0 0 0.5rem; font-size: 1rem; }
+[data-consumer-hours] ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; grid-template-columns: repeat(auto-fill, minmax(min(100%, 14rem), 1fr)); }
+[data-consumer-hours] li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.5rem; min-width: 0; padding: 0.5rem 0.75rem; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+[data-consumer-hours] li span { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+[data-consumer-hours] small { flex-basis: 100%; color: var(--muted); }

@@ -614,18 +614,41 @@
 			<template x-if="assignations.length">
 				<div role="region" tabindex="0" aria-label="Mes consommateurs">
 					<table>
-						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Société</th><th></th></tr></thead>
+						<thead><tr><th>Nom</th><th>Utilisateur</th><th>Société</th><th>Intercours (min)</th><th></th></tr></thead>
 						<tbody>
 							<template x-for="x in assignations" :key="x.id">
 								<tr>
 									<td x-text="consumerLabel(x)"></td>
 									<td x-text="consumerOf(x).username"></td>
 									<td x-text="x.companyName"></td>
+									<td>
+										<input type="number" min="0" max="1440" step="5" :value="x.intercourseMinutes ?? 0" @change="saveIntercourse(x, $event.target.value)" :disabled="busy" :aria-label="'Intercours de ' + consumerLabel(x) + ' (minutes)'">
+										<template x-if="assignations.length > 1">
+											<button type="button" @click="toggleIntercourse(x)" :aria-expanded="openIntercourse === x.id" x-text="openIntercourse === x.id ? 'Masquer' : 'Avec un autre…'"></button>
+										</template>
+									</td>
 									<td><button type="button" @click="showOnly(x.id)">Voir ses disponibilités</button></td>
 								</tr>
 							</template>
 						</tbody>
 					</table>
+				</div>
+			</template>
+			<!-- Intercourse of one consumer with each other one (the order does not matter); empty = the default -->
+			<template x-for="x in assignations.filter(a => a.id === openIntercourse)" :key="x.id">
+				<div data-intercourse>
+					<h2>Intercours de <span x-text="consumerLabel(x)"></span> avec…</h2>
+					<p>Par défaut, entre deux rendez-vous il faut le plus grand des deux intercours. Indiquez une autre valeur pour un consommateur précis (dans un sens ou dans l’autre), ou laissez vide pour garder la valeur par défaut.</p>
+					<ul>
+						<template x-for="y in assignations.filter(a => a.id !== x.id)" :key="y.id">
+							<li>
+								<label><span x-text="consumerLabel(y)"></span>
+									<input type="number" min="0" max="1440" step="5" :value="pairIntercourse(x.id, y.id) ?? ''" :placeholder="'Défaut : ' + Math.max(x.intercourseMinutes ?? 0, y.intercourseMinutes ?? 0) + ' min'"
+										@change="savePairIntercourse(x, y, $event.target.value)" :disabled="busy">
+								</label>
+							</li>
+						</template>
+					</ul>
 				</div>
 			</template>
 		</section>
@@ -736,8 +759,8 @@
 							<p>Ma demande : <b x-text="progress(currentRequest())"></b>. Touchez ou sélectionnez un créneau libre pour ajouter une disponibilité.</p>
 							<!-- The number of hours can be changed (or the limit removed) at any time -->
 							<form data-inline @submit.prevent="updateRequestHours()">
-								<label><span x-text="isUnlimited(currentRequest()) ? 'Limiter à (heures)' : 'Modifier le nombre d’heures'"></span>
-									<input type="number" min="0.5" step="0.5" x-model="form.editHours" :placeholder="isUnlimited(currentRequest()) ? 'Sans limite' : currentRequest().requestedHours">
+								<label><span x-text="isUnlimited(currentRequest()) ? 'Limiter à (heures)' : 'Heures encore souhaitées'"></span>
+									<input type="number" min="0.5" step="0.5" x-model="form.editHours" :placeholder="isUnlimited(currentRequest()) ? 'Sans limite' : remainingHours(currentRequest())">
 								</label>
 								<button type="submit" :disabled="busy || !form.editHours" x-text="isUnlimited(currentRequest()) ? 'Fixer la limite' : 'Enregistrer'"></button>
 								<template x-if="!isUnlimited(currentRequest())"><button type="button" @click="updateRequestHours(true)" :disabled="busy">Retirer la limite</button></template>
@@ -816,6 +839,8 @@
 				<li><i data-kind="dispo"></i> Disponibilité</li>
 				<li><i data-kind="meeting" data-status="pending"></i> Rendez-vous en attente</li>
 				<li><i data-kind="meeting" data-status="done"></i> Rendez-vous terminé</li>
+				<template x-if="page === 'agent-agenda'"><li><i data-kind="proposal"></i> Proposition (non enregistrée)</li></template>
+				<template x-if="page === 'agent-agenda'"><li><i data-gap></i> Intercours</li></template>
 			</ul>
 
 			<div data-scroll x-ref="scroller" @touchstart.passive="cal.swipeStart($event)" @touchend="cal.swipeEnd($event)" :aria-busy="loading">
@@ -837,8 +862,12 @@
 						<div data-day role="group" :aria-label="cal.longDay(d)" :data-today="cal.isToday(d)"
 							@pointerdown="cal.down($event, d)" @pointermove="cal.move($event)" @pointerup="cal.up($event)" @pointercancel="cal.cancel()"
 							@touchmove="cal.touchMove($event)" @contextmenu.prevent>
+							<!-- Intercourse between two meetings: greyed, behind the events, never clickable -->
+							<template x-for="g in cal.gapsFor(d)" :key="g.ev.id">
+								<div data-gap :data-status="g.ev.status" x-place="cal.place(g)" :title="g.ev.title + (g.ev.status === 'short' ? ' (non respecté)' : '')" aria-hidden="true"><small x-text="g.ev.title"></small></div>
+							</template>
 							<template x-for="p in cal.layoutFor(d)" :key="p.ev.id">
-								<button type="button" data-event :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
+								<button type="button" data-event :data-event-id="p.ev.id" :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
 									:aria-label="kindLabel(p.ev.kind) + ', ' + p.ev.title + (p.ev.love != null ? ', préférence ' + Math.round(p.ev.love * 100) + ' %' : '') + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
 									<b x-text="p.ev.title"></b>
 									<template x-if="p.ev.love != null"><small data-love title="Préférence" x-text="Math.round(p.ev.love * 100) + ' %'"></small></template>
@@ -855,6 +884,38 @@
 					</template>
 				</div>
 			</div>
+
+			<!-- Agent: hours each consumer still wants (validated or done meetings are not counted) -->
+			<template x-if="page === 'agent-agenda' && assignations.length">
+				<section data-consumer-hours aria-labelledby="consumer-hours-title">
+					<h2 id="consumer-hours-title">Heures souhaitées par consommateur</h2>
+					<ul>
+						<template x-for="x in visibleAssignations()" :key="x.id">
+							<li>
+								<span x-text="consumerLabel(x)"></span>
+								<b x-text="consumerHoursLabel(x.id)"></b>
+								<small x-text="consumerHours(x.id).scheduled + ' h déjà planifiées'"></small>
+							</li>
+						</template>
+					</ul>
+					<template x-if="!visibleAssignations().length"><p><small>Aucun consommateur ne demande encore des heures.</small></p></template>
+				</section>
+			</template>
+
+			<!-- Agent: automatic proposals, computed in the browser and only saved when validated -->
+			<template x-if="page === 'agent-agenda'">
+				<form data-propose @submit.prevent="proposeMeetings()">
+					<label>Durée maximale (min) <input type="number" min="15" step="15" x-model.number="planForm.maxMinutes" required></label>
+					<button type="submit" :disabled="busy || loading">Proposer des rendez-vous</button>
+					<template x-if="proposals.length">
+						<span data-actions>
+							<button type="button" @click="validateAllProposals()" :disabled="busy" x-text="'Tout valider (' + proposals.length + ')'"></button>
+							<button type="button" data-variant="danger" @click="clearProposals()" :disabled="busy">Tout effacer</button>
+						</span>
+					</template>
+					<small>Un rendez-vous par consommateur affiché, d’une durée égale au plus petit entre la durée maximale et les heures qu’il demande encore. Les propositions servent d’abord le plus de consommateurs possible, puis les créneaux préférés, en respectant vos horaires, les heures demandées et les intercours. Rien n’est enregistré avant validation.</small>
+				</form>
+			</template>
 
 			<!-- Cancelled meetings are kept out of the grid and listed here -->
 			<section data-cancelled aria-labelledby="cancelled-title">
@@ -929,6 +990,18 @@
 							<label>Commentaire <textarea x-model="panel.form.comment" maxlength="2000" rows="3"></textarea></label>
 							<p data-actions><button type="submit" :disabled="busy">Créer le rendez-vous</button></p>
 						</form>
+					</template>
+
+					<template x-if="panel.type === 'proposal'">
+						<div>
+							<h2>Proposition de rendez-vous</h2>
+							<p><b x-text="panel.ev.title"></b>, <span x-text="cal.longDay(panel.ev.start)"></span> de <b x-text="cal.time(panel.ev.start)"></b> à <b x-text="cal.time(panel.ev.end)"></b>.</p>
+							<p><small>Cette proposition n’est pas encore enregistrée.</small></p>
+							<p data-actions>
+								<button type="button" @click="validateProposal()" :disabled="busy">Valider</button>
+								<button type="button" data-variant="danger" @click="eraseProposal()" :disabled="busy">Effacer</button>
+							</p>
+						</div>
 					</template>
 
 					<template x-if="panel.type === 'meeting'">

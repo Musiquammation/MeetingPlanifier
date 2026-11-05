@@ -336,6 +336,40 @@ export function initApi(app: Express, database: Db): void {
 	catch (e: any) { return fail(res, 400, e.message); }
   });
 
+  /** Intercourse ("intercours"): minutes the agent needs between two meetings. */
+  const intercourseInput = (value: unknown): number => {
+	const n = Number(value);
+	if (!Number.isInteger(n) || n < 0 || n > 1440) throw new Error("L’intercours doit être un nombre entier de minutes entre 0 et 1440.");
+	return n;
+  };
+  const ownsAssignation = (req: Request, id: number) => database.listAssignationsForAgent(session(req).id).some((a: any) => a.id === id);
+
+  app.get("/api/intercourse-pairs", auth(["agent"]), (req, res) => {
+	try { return res.json(database.listIntercoursePairsForAgent(session(req).id)); }
+	catch (e: any) { return fail(res, 400, e.message); }
+  });
+  /** Default intercourse of one of my consumers. */
+  app.patch("/api/my-consumers/:id", auth(["agent"]), (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (!ownsAssignation(req, id)) return fail(res, 404, "Consommateur introuvable.");
+	  database.setAssignationIntercourse(id, intercourseInput(req.body.intercourseMinutes));
+	  return res.json({ ok: true });
+	} catch (e: any) { return fail(res, 400, e.message || "Modification impossible."); }
+  });
+  /** Intercourse of a pair of my consumers (the order does not matter); minutes null = back to the default. */
+  app.put("/api/intercourse-pairs", auth(["agent"]), (req, res) => {
+	try {
+	  const a = positiveInt(req.body.assignationA, "assignationA");
+	  const b = positiveInt(req.body.assignationB, "assignationB");
+	  if (a === b) return fail(res, 400, "Choisissez deux consommateurs différents.");
+	  if (!ownsAssignation(req, a) || !ownsAssignation(req, b)) return fail(res, 404, "Consommateur introuvable.");
+	  const minutes = req.body.minutes === null || req.body.minutes === undefined || req.body.minutes === "" ? null : intercourseInput(req.body.minutes);
+	  database.setIntercoursePair(a, b, minutes);
+	  return res.json(database.listIntercoursePairsForAgent(session(req).id));
+	} catch (e: any) { return fail(res, 400, e.message || "Modification impossible."); }
+  });
+
   app.get("/api/rooms", auth(), (req, res) => {
 	try {
 	  const s = session(req);
@@ -417,6 +451,7 @@ export function initApi(app: Express, database: Db): void {
 		const assignations = database.listAssignationDetailsForAgent(s.id);
 		return res.json({
 		  contracts, assignations,
+		  intercoursePairs: database.listIntercoursePairsForAgent(s.id),
 		  suggestions: contracts.flatMap((c: any) => database.listSuggestionsForContract(c.id, from, to)),
 		  // Requests of the agent's consumers (with the hours still to schedule): used to find who is asking for hours.
 		  requests: assignations.flatMap((a: any) => database.listAvailabilityRequestsForAssignation(a.id)),
@@ -438,8 +473,9 @@ export function initApi(app: Express, database: Db): void {
 	} catch (e: any) { return fail(res, 400, e.message); }
   });
   /**
-   * Changes the hours of a request at any time. requestedHours null / "" removes the limit (back to "unlimited").
-   * The new total cannot be below the hours already scheduled.
+   * Changes the hours the consumer still wants, at any time. requestedHours null / "" removes the limit (back to
+   * "unlimited"). Meetings already booked (validated by the agent, or done) are not counted: booking one lowers
+   * the remaining hours and cancelling one gives them back.
    */
   app.patch("/api/availability-requests/:id", auth(["consumer"]), (req, res) => {
 	try {
@@ -454,11 +490,7 @@ export function initApi(app: Express, database: Db): void {
 		if (!Number.isFinite(hours) || hours <= 0 || hours > UNLIMITED_HOURS) return fail(res, 400, "requestedHours doit être supérieur à 0.");
 	  }
 	  return res.json(database.updateAvailabilityRequestHours(id, hours));
-	} catch (e: any) {
-	  const m = String(e.message || "");
-	  const below = /already scheduled/.test(m) ? m.match(/the ([\d.]+) h already/) : null;
-	  return fail(res, 400, below ? `Vous avez déjà ${below[1]} h planifiées : indiquez au moins ce nombre d’heures, ou retirez la limite.` : m || "Modification impossible.");
-	}
+	} catch (e: any) { return fail(res, 400, e.message || "Modification impossible."); }
   });
   app.get("/api/disponibilities", auth(), (req, res) => {
 	try {

@@ -1,7 +1,7 @@
 // Calendar: view model for the schedule panel (no DOM rendering here, the HTML templates do that).
 // Responsibilities: visible range, navigation, overlap layout, selection (click, mouse drag, long press), swipe, settings.
 
-export type EventKind = "meeting" | "dispo" | "suggestion" | "slot";
+export type EventKind = "meeting" | "dispo" | "suggestion" | "slot" | "proposal";
 
 export interface CalEvent {
 	id: string;
@@ -28,6 +28,8 @@ interface Selection { day: Date; from: number; to: number } // minutes since mid
 interface Drag {
 	day: Date; col: HTMLElement; captureEl: HTMLElement; y0: number; y0Raw: number; x0: number; yPx0: number;
 	moved: boolean; pressed: boolean; onEvent: boolean; mouse: boolean; pointerId: number; timer: number;
+	/** Event under the pointer when the gesture started (see onSelect). */
+	origin: CalEvent | null;
 }
 
 // ---- Date helpers (shared with DomHandler) ----------------------------------
@@ -58,6 +60,8 @@ export class Calendar {
 	settings: CalSettings = loadSettings();
 	anchor = new Date();
 	events: CalEvent[] = [];
+	/** Greyed bands drawn behind the events (intercourse between two meetings); never clickable. */
+	gaps: CalEvent[] = [];
 	now = new Date();
 	isMobile = false;
 	selection: Selection | null = null;
@@ -65,7 +69,8 @@ export class Calendar {
 	lastPoint: Date | null = null;
 
 	onRange: (() => void) | null = null; // the visible range changed: reload data
-	onSelect: ((start: Date, end: Date) => void) | null = null; // an empty slot was picked
+	/** A slot was picked; origin is the event under the pointer when the drag or long press started. */
+	onSelect: ((start: Date, end: Date, origin: CalEvent | null) => void) | null = null;
 
 	private drag: Drag | null = null;
 	private swipe: { x: number; y: number } | null = null;
@@ -144,6 +149,7 @@ export class Calendar {
 	// ---- Layout ----------------------------------------------------------
 	/** Events of one day with lane assignment so overlapping events sit side by side. */
 	layoutFor(day: Date): Placed[] { return this.layout(this.events, day); }
+	gapsFor(day: Date): Placed[] { return this.layout(this.gaps, day); }
 
 	/** Same layout for an arbitrary list of events (the room calendar draws one column per room). */
 	layout(events: CalEvent[], day: Date): Placed[] {
@@ -226,7 +232,8 @@ export class Calendar {
 	 * Mouse: a click on an empty space creates a 1 h slot, a drag draws the slot.
 	 * Touch (and mouse): holding still on the same quarter hour opens a slot that the drag then stretches.
 	 * A finger that moves before the long press scrolls the page as usual.
-	 * A click on an event opens it (handled by the template); a drag or long press over it draws a new slot.
+	 * A click on an event opens it (handled by the template); a drag or long press over it draws a new slot
+	 * and reports that event as the origin (the agent agenda books a meeting when it is an availability).
 	 */
 	down(e: PointerEvent, day: Date) {
 		const mouse = e.pointerType === "mouse";
@@ -238,7 +245,8 @@ export class Calendar {
 		const y0 = this.minutesAt(e, col);
 		const d: Drag = {
 			day, col, captureEl, y0, y0Raw: this.rawMinutesAt(e, col), x0: e.clientX, yPx0: e.clientY,
-			moved: false, pressed: false, onEvent: !!eventEl, mouse, pointerId: e.pointerId, timer: 0
+			moved: false, pressed: false, onEvent: !!eventEl, mouse, pointerId: e.pointerId, timer: 0,
+			origin: this.events.find((x) => x.id === eventEl?.dataset.eventId) ?? null
 		};
 		d.timer = window.setTimeout(() => this.longPress(), LONG_PRESS_MS);
 		this.drag = d;
@@ -292,7 +300,7 @@ export class Calendar {
 		const sel = this.selection;
 		if ((d.moved || d.pressed) && sel) {
 			this.suppressEventClickUntil = Date.now() + 500; // the click that follows must not open the event below
-			this.onSelect?.(this.dateAt(d.day, sel.from), this.dateAt(d.day, sel.to));
+			this.onSelect?.(this.dateAt(d.day, sel.from), this.dateAt(d.day, sel.to), d.origin);
 			return;
 		}
 		this.selection = null;
@@ -300,7 +308,7 @@ export class Calendar {
 		if (!d.onEvent) {
 			const to = Math.min(d.y0 + TAP_MINUTES, this.settings.endHour * 60);
 			this.selection = { day: d.day, from: d.y0, to };
-			this.onSelect?.(this.dateAt(d.day, d.y0), this.dateAt(d.day, to));
+			this.onSelect?.(this.dateAt(d.day, d.y0), this.dateAt(d.day, to), null);
 		}
 	}
 

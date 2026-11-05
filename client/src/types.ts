@@ -56,12 +56,20 @@ export interface AvailabilityRequest {
 	assignationId: Id;
 	requestedHours: number;
 	scheduledHours?: number;
+	/** Hours still wanted (validated or done meetings are not counted). */
+	remainingHours?: number;
 	/** Raw values from the server (minutes), used to know the hours that remain. */
 	status?: "open" | "fulfilled" | "closed";
 	requestedMinutes?: number;
 	scheduledMinutes?: number;
 	remainingMinutes?: number;
 }
+
+/** Intercourse chosen for a pair of consumers of the agent (unordered, replaces max of both defaults). */
+export interface IntercoursePair { assignationA: Id; assignationB: Id; minutes: number }
+
+/** Meeting proposed by the optimizer of the agent agenda: client side only until validated. */
+export interface Proposal { id: string; assignationId: Id; start: Date; end: Date; score: number }
 
 declare global {
 	interface Window { SERVER_ADDRESS: string }
