@@ -4,8 +4,7 @@
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 	<title>Planning – rendez-vous et salles</title>
-	<link rel="stylesheet" href="./style.css">
-	<script type="module" src="./src/index.ts"></script>
+	<link rel="stylesheet" href="style.css">
 </head>
 <body x-data="app" x-cloak @keydown.escape.window="closePanel()">
 
@@ -158,7 +157,7 @@
 								<tr>
 									<td x-text="c.name + ' ' + c.surname"></td>
 									<td x-text="c.username"></td>
-									<td><button type="button" @click="enroll(c)" :disabled="busy">Inscrire à ma société</button></td>
+									<td><button type="button" data-variant="add" @click="enroll(c)" :disabled="busy">Inscrire à ma société</button></td>
 								</tr>
 							</template>
 						</tbody>
@@ -184,7 +183,7 @@
 						<tbody>
 							<template x-for="c in consumers" :key="consumerKey(c)">
 								<tr>
-									<td x-text="consumerLabel(c)"></td><td x-text="consumerOf(c).username"></td><td><button type="button" data-copy @click="copyConsumerLink(c)" :title="'Copier le lien d’accès de ' + consumerLabel(c)"><code x-text="fidelityKey(c)"></code> Copier le lien</button></td>
+									<td x-text="consumerLabel(c)"></td><td x-text="consumerOf(c).username"></td><td><button type="button" data-copy @click="copyConsumerLink(c)" :title="'Copier le lien d’accès de ' + consumerLabel(c)"><code x-text="fidelityKey(c)"></code></button></td>
 									<td>
 										<select :aria-label="'Formule par défaut de ' + consumerLabel(c)" @change="setConsumerPackage(c, $event.target.value)" :disabled="busy">
 											<option value="" :selected="defaultPackageId(c) === null" x-text="'Aucune (' + money(0) + ')'"></option>
@@ -241,7 +240,7 @@
 									<td x-text="a.username"></td>
 									<td>
 										<template x-if="inCompany(a)"><span>Déjà dans ma société</span></template>
-										<template x-if="!inCompany(a)"><button type="button" @click="attachAgent(a)" :disabled="busy">Rattacher à ma société</button></template>
+										<template x-if="!inCompany(a)"><button type="button" data-variant="add" @click="attachAgent(a)" :disabled="busy">Rattacher à ma société</button></template>
 									</td>
 								</tr>
 							</template>
@@ -293,7 +292,7 @@
 									<tr data-sub><td colspan="4">Aucun consommateur assigné.</td></tr>
 								</template>
 								<template x-if="openAgent === a.id">
-									<tr data-sub><td colspan="4"><button type="button" @click="openAssign(a)" :disabled="busy">Attribuer un autre consommateur</button></td></tr>
+									<tr data-sub><td colspan="4"><button type="button" data-variant="add" @click="openAssign(a)" :disabled="busy">Attribuer un autre consommateur</button></td></tr>
 								</template>
 							</tbody>
 						</template>
@@ -337,7 +336,7 @@
 							</tbody>
 						</table>
 					</div>
-					<p data-savebar><button type="button" @click="saveRooms()" :disabled="busy">Enregistrer</button></p>
+					<p data-savebar><button type="button" data-variant="primary" @click="saveRooms()" :disabled="busy">Enregistrer</button></p>
 				</div>
 			</template>
 
@@ -346,7 +345,7 @@
 			<form @submit.prevent="autoAssignRooms()">
 				<label>Début de la période <input type="datetime-local" step="900" x-model="form.autoFrom" required></label>
 				<label>Fin de la période <input type="datetime-local" step="900" x-model="form.autoTo" required></label>
-				<button type="submit" :disabled="busy || !rooms.length">Attribuer automatiquement</button>
+				<button type="submit" data-variant="auto" :disabled="busy || !rooms.length">Attribuer automatiquement</button>
 			</form>
 
 			<h2>Calendrier des salles</h2>
@@ -485,7 +484,7 @@
 						</template>
 					</ol>
 					<p data-actions>
-						<button type="button" @click="res.addSort()" :disabled="!res.canAddSort()">+ Ajouter un tri</button>
+						<button type="button" data-variant="add" @click="res.addSort()" :disabled="!res.canAddSort()">+ Ajouter un tri</button>
 						<button type="button" @click="res.resetSorts()" :disabled="!res.sorts.length">Aucun tri</button>
 					</p>
 				</div>
@@ -535,7 +534,7 @@
 										<td>
 											<template x-if="r.status === 'pending'">
 												<span data-row-actions>
-													<button type="button" @click="resultDone(r.id)" :disabled="busy">Terminer</button>
+													<button type="button" data-variant="confirm" @click="resultDone(r.id)" :disabled="busy">Terminer</button>
 													<button type="button" data-variant="danger" @click="resultCancel(r.id)" :disabled="busy">Annuler</button>
 												</span>
 											</template>
@@ -702,8 +701,8 @@
 					<label for="script-code">Code du script <small x-show="scriptDirty()">(modifications non enregistrées)</small></label>
 					<textarea id="script-code" data-code x-model="scriptCode" spellcheck="false" autocapitalize="off" autocomplete="off" rows="22" maxlength="100000" @keydown.tab="scriptTab($event)"></textarea>
 					<p data-actions>
-						<button type="button" @click="saveScript()" :disabled="busy || !scriptDirty()">Enregistrer</button>
-						<template x-if="!script.enabled"><button type="button" @click="toggleScript(true)" :disabled="busy">Enregistrer et activer</button></template>
+						<button type="button" data-variant="primary" @click="saveScript()" :disabled="busy || !scriptDirty()">Enregistrer</button>
+						<template x-if="!script.enabled"><button type="button" data-variant="confirm" @click="toggleScript(true)" :disabled="busy">Enregistrer et activer</button></template>
 						<template x-if="script.enabled"><button type="button" data-variant="danger" @click="toggleScript(false)" :disabled="busy">Désactiver</button></template>
 						<button type="button" @click="resetScriptTemplate()" :disabled="busy">Revenir à l’exemple</button>
 					</p>
@@ -722,7 +721,7 @@
 								<template x-for="m in meetings" :key="m.id"><option :value="String(m.id)" x-text="meetingOptionLabel(m)"></option></template>
 							</select>
 						</label>
-						<button type="submit" :disabled="busy" x-text="busy ? 'Exécution…' : 'Lancer le test'"></button>
+						<button type="submit" data-variant="auto" :disabled="busy" x-text="busy ? 'Exécution…' : 'Lancer le test'"></button>
 					</form>
 					<template x-if="scriptTest.last">
 						<div data-run-output :data-status="scriptTest.last.status" role="status">
@@ -917,7 +916,7 @@
 					<button type="button" @click="cal.setView('week')" :aria-pressed="cal.settings.mode === 'week'">Semaine</button>
 				</div>
 				<label>Aller à <input type="date" @change="cal.goTo($event.target.value)"></label>
-				<button type="button" @click="openCreate()" x-text="page === 'agent-agenda' ? 'Ajouter mes horaires' : 'Ajouter une disponibilité'"></button>
+				<button type="button" data-variant="add" @click="openCreate()" x-text="page === 'agent-agenda' ? 'Ajouter mes horaires' : 'Ajouter une disponibilité'"></button>
 			</div>
 
 			<details data-settings>
@@ -1021,10 +1020,10 @@
 			<template x-if="page === 'agent-agenda'">
 				<form data-propose @submit.prevent="proposeMeetings()">
 					<label>Durée maximale (min) <input type="number" min="15" step="15" x-model.number="planForm.maxMinutes" required></label>
-					<button type="submit" :disabled="busy || loading">Proposer des rendez-vous</button>
+					<button type="submit" data-variant="auto" :disabled="busy || loading">Proposer des rendez-vous</button>
 					<template x-if="proposals.length">
 						<span data-actions>
-							<button type="button" @click="validateAllProposals()" :disabled="busy" x-text="'Tout valider (' + proposals.length + ')'"></button>
+							<button type="button" data-variant="confirm" @click="validateAllProposals()" :disabled="busy" x-text="'Tout valider (' + proposals.length + ')'"></button>
 							<button type="button" data-variant="danger" @click="clearProposals()" :disabled="busy">Tout effacer</button>
 						</span>
 					</template>
@@ -1083,7 +1082,7 @@
 						<div>
 							<h2>Horaires de l’agent</h2>
 							<p x-text="fmt(panel.ev.raw.startAt) + ' · ' + panel.ev.raw.durationMinutes + ' min'"></p>
-							<p data-actions><button type="button" @click="useSlot()">Proposer une disponibilité ici</button></p>
+							<p data-actions><button type="button" data-variant="add" @click="useSlot()">Proposer une disponibilité ici</button></p>
 						</div>
 					</template>
 
@@ -1113,7 +1112,7 @@
 							<p><b x-text="panel.ev.title"></b>, <span x-text="cal.longDay(panel.ev.start)"></span> de <b x-text="cal.time(panel.ev.start)"></b> à <b x-text="cal.time(panel.ev.end)"></b>.</p>
 							<p><small>Cette proposition n’est pas encore enregistrée.</small></p>
 							<p data-actions>
-								<button type="button" @click="validateProposal()" :disabled="busy">Valider</button>
+								<button type="button" data-variant="confirm" @click="validateProposal()" :disabled="busy">Valider</button>
 								<button type="button" data-variant="danger" @click="eraseProposal()" :disabled="busy">Effacer</button>
 							</p>
 						</div>
@@ -1141,7 +1140,7 @@
 									<label>Commentaire <textarea x-model="panel.form.comment" maxlength="2000" rows="3"></textarea></label>
 									<p data-actions>
 										<button type="submit" :disabled="busy">Enregistrer</button>
-										<button type="button" @click="markDone()" :disabled="busy">Marquer comme terminé</button>
+										<button type="button" data-variant="confirm" @click="markDone()" :disabled="busy">Marquer comme terminé</button>
 									</p>
 								</form>
 							</template>
@@ -1156,5 +1155,14 @@
 	</template>
 </main>
 
+<script>
+	window.SERVER_ADDRESS = "http://localhost:8020";
+
+	// Initialize the application after the DOM has been fully loaded
+	document.addEventListener("DOMContentLoaded", async () => {
+		const { init } = await import("/src/index.ts");
+		init();
+	});
+</script>
 </body>
 </html>

@@ -1,6 +1,6 @@
-// Entry point. The server address is read lazily by Fetcher, at request time.
+// Entry point. window.SERVER_ADDRESS is set by index.html and read lazily by Fetcher, at request time.
 import { dom } from "./domHandler";
 
-window.SERVER_ADDRESS = "http://localhost:8020";
-
-void dom.start();
+export function init(): void {
+	void dom.start();
+}
