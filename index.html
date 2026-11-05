@@ -4,8 +4,8 @@
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 	<title>Planning – rendez-vous et salles</title>
-  <script type="module" crossorigin src="./public/index-DZv8X__0.js"></script>
-  <link rel="stylesheet" crossorigin href="./public/index-DIeIvmV4.css">
+	<link rel="stylesheet" href="public/style.css">
+	<link rel="icon" href="data:,">
 </head>
 <body x-data="app" x-cloak @keydown.escape.window="closePanel()">
 
@@ -1156,5 +1156,12 @@
 	</template>
 </main>
 
+<script>
+	window.SERVER_ADDRESS = "http://localhost:8020";
+
+	document.addEventListener("DOMContentLoaded", () => {
+		import("./public/bundle.js").then(m => m.init());
+	});
+</script>
 </body>
 </html>
