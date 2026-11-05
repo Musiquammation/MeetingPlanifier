@@ -1,4 +1,4 @@
-git switch master &&
+
 rm -rf client/dist &&
 npm run bundle &&
 cp -r client/public client/dist &&
