@@ -8,7 +8,18 @@ Les types d’entrée et de sortie (`Company`, `Agent`, `Meeting`, etc.) sont d�
 
 ### Initialisation et transactions
 
-- **`initialize(): void`** — Crée les tables, index et triggers manquants sans supprimer les données existantes.
+- **`initialize(): void`** — Crée les tables, index et triggers manquants sans supprimer les données existantes, puis applique les migrations versionnées.
+
+### Version et migrations
+
+`server/VERSION_NUMBER.ts` donne la version du schéma attendue par le code (2 = v1.1.0). La version des données est dans le fichier texte `VERSION_NUMBER` à côté de la base (`dist/VERSION_NUMBER`). Au démarrage :
+
+- fichier **vide** : aucune migration, la version courante y est écrite (nouvelle installation) ;
+- fichier **absent** : version 1 si la base contenait déjà des données (base d’avant le versionnage), sinon comme vide ;
+- version **inférieure** : copie de la base (`database.before-v<N>.<date>.sqlite`), puis chaque migration `migrations/migration_<N>.ts` jusqu’à la version courante, chacune dans une transaction ; le fichier est mis à jour après chacune ;
+- version **supérieure** : le démarrage est refusé.
+
+Pour ajouter une migration : augmenter `VERSION_NUMBER`, écrire `migrations/migration_<N>.ts`, l’ajouter à `MIGRATIONS` dans `migrations/index.ts`, et mettre à jour `SCHEMA_SQL` pour qu’une base neuve ait directement le schéma final.
 - **`withTransaction(callback: () => T): T`** — Exécute un callback dans une transaction atomique, avec savepoints imbriqués.
 - **`healthCheck(): { ok: true; sqliteVersion: string; databasePath: string }`** — Retourne l’état de la base, la version SQLite et le chemin utilisé.
 - **`close(): void`** — Ferme la connexion SQLite si elle est encore ouverte.

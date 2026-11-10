@@ -1,8 +1,10 @@
-import { mkdirSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { randomInt } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { DATE_RE, isValidTimeZone, occurrences, zonedTime } from "../shared/recurrence";
+import { MIGRATIONS } from "../migrations/index";
+import { VERSION_NUMBER } from "./VERSION_NUMBER";
 
 export type MeetingStatus = "pending" | "done" | "canceledBy";
 export type AgentStatus = "pending" | "active" | "disabled";
@@ -516,6 +518,8 @@ CREATE TABLE IF NOT EXISTS disponibilities (
   start_at TEXT NOT NULL,
   duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0 AND duration_minutes <= 44640),
   love REAL NOT NULL CHECK (love >= 0 AND love <= 1),
+  generator_id INTEGER REFERENCES generators(id) ON DELETE SET NULL,
+  generator_occurrence TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (assignation_id) REFERENCES assignations(id) ON DELETE RESTRICT,
@@ -530,6 +534,8 @@ CREATE TABLE IF NOT EXISTS suggestions (
   start_at TEXT NOT NULL,
   duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0 AND duration_minutes <= 44640),
   love REAL NOT NULL CHECK (love >= 0 AND love <= 1),
+  generator_id INTEGER REFERENCES generators(id) ON DELETE SET NULL,
+  generator_occurrence TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE RESTRICT
@@ -551,6 +557,7 @@ CREATE TABLE IF NOT EXISTS meetings (
   comment TEXT NOT NULL DEFAULT '' CHECK (length(comment) <= 4000),
   hourly_rate REAL NOT NULL DEFAULT 0 CHECK (hourly_rate >= 0),
   society_rate REAL NOT NULL DEFAULT 28 CHECK (society_rate >= 0 AND society_rate <= 1000),
+  actual_duration_minutes INTEGER CHECK (actual_duration_minutes IS NULL OR (actual_duration_minutes > 0 AND actual_duration_minutes <= 44640)),
   canceled_by_role TEXT CHECK (canceled_by_role IS NULL OR canceled_by_role IN ('admin', 'agent', 'consumer')),
   canceled_by_id INTEGER,
   idempotency_key TEXT UNIQUE,
@@ -720,12 +727,88 @@ END;
   this.initialize();
   }
 
-  /** Create all tables and indexes without destroying an existing database. */
+  /**
+   * Create all tables and indexes without destroying an existing database, then bring the data to VERSION_NUMBER
+   * with the versioned migrations of migrations/ (see runVersionedMigrations).
+   */
   initialize(): void {
   this.ensureOpen();
+  const existed = this.connection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'companies'").get() !== undefined;
   this.connection.exec(Database.SCHEMA_SQL);
   this.migrate();
+  this.runVersionedMigrations(existed);
+  this.connection.exec(Database.INDEX_SQL);
   this.connection.exec("PRAGMA user_version = 1;");
+  }
+
+  /** Indexes on columns added by versioned migrations: created once those columns exist. */
+  private static readonly INDEX_SQL = `
+CREATE INDEX IF NOT EXISTS idx_disponibilities_generator ON disponibilities(generator_id, generator_occurrence);
+CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id, generator_occurrence);
+`;
+
+  /** Text file holding the version of the data, next to the database (dist/VERSION_NUMBER); null in memory. */
+  private get versionFile(): string | null {
+  if (this.databasePath === ":memory:" || this.databasePath.startsWith("file:")) return null;
+  return join(dirname(this.databasePath), "VERSION_NUMBER");
+  }
+
+  /**
+   * Versioned migrations. The file dist/VERSION_NUMBER holds the version of the data:
+   *  - empty: nothing is migrated, the current VERSION_NUMBER is written (new installation);
+   *  - missing: version 1 if the database already had data (it predates the versioning), else like empty;
+   *  - lower than VERSION_NUMBER: the database is copied (database.before-v<N>.<date>.sqlite), then every
+   *    migration from version + 1 to VERSION_NUMBER runs in order, each in a transaction, and the file is updated
+   *    after each one (a failure stops the start-up, the file keeps the last version reached);
+   *  - higher than VERSION_NUMBER: the start-up is refused (the data comes from a newer version of the code).
+   */
+  private runVersionedMigrations(existed: boolean): void {
+  const file = this.versionFile;
+  if (!file) return;
+  const write = (version: number) => {
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, `${version}\n`);
+    renameSync(tmp, file);
+  };
+  const content = existsSync(file) ? readFileSync(file, "utf8").trim() : null;
+  let version: number;
+  if (content === "" || (content === null && !existed)) {
+    write(VERSION_NUMBER);
+    return;
+  }
+  if (content === null) version = 1;
+  else {
+    version = Number(content);
+    if (!Number.isInteger(version) || version < 1) throw new Error(`${file} must contain a version number (found "${content}")`);
+  }
+  if (version > VERSION_NUMBER) {
+    throw new Error(`The database is at version ${version} but this code expects ${VERSION_NUMBER}: update the server`);
+  }
+  if (version === VERSION_NUMBER) { if (content === null) write(version); return; }
+
+  const todo = MIGRATIONS.filter((m) => m.version > version && m.version <= VERSION_NUMBER).sort((a, b) => a.version - b.version);
+  for (let v = version + 1; v <= VERSION_NUMBER; v += 1) {
+    if (!todo.some((m) => m.version === v)) throw new Error(`Missing migration to version ${v} (migrations/migration_${v}.ts)`);
+  }
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "");
+  const backup = this.databasePath.replace(/(\.sqlite)?$/, `.before-v${VERSION_NUMBER}.${stamp}.sqlite`);
+  this.connection.prepare("VACUUM INTO ?").run(backup);
+  console.log(`[database] version ${version} -> ${VERSION_NUMBER}, backup: ${backup}`);
+
+  const hasColumn = (table: string, column: string): boolean =>
+    (this.connection.prepare(`PRAGMA table_info(${table})`).all() as RawRow[]).some((row) => String(row.name) === column);
+  const tools = {
+    exec: (sql: string) => this.connection.exec(sql),
+    hasColumn,
+    addColumn: (table: string, column: string, definition: string) => {
+    if (!hasColumn(table, column)) this.connection.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    },
+  };
+  for (const migration of todo) {
+    this.withTransaction(() => migration.up(tools));
+    write(migration.version);
+    console.log(`[database] migration ${migration.version} done: ${migration.description}`);
+  }
   }
 
   /**
@@ -752,16 +835,6 @@ END;
   }
   if (!hasColumn("meetings", "society_rate")) {
     this.connection.exec("ALTER TABLE meetings ADD COLUMN society_rate REAL NOT NULL DEFAULT 28 CHECK (society_rate >= 0 AND society_rate <= 1000)");
-  }
-  if (!hasColumn("meetings", "actual_duration_minutes")) {
-    this.connection.exec("ALTER TABLE meetings ADD COLUMN actual_duration_minutes INTEGER CHECK (actual_duration_minutes IS NULL OR (actual_duration_minutes > 0 AND actual_duration_minutes <= 44640))");
-  }
-  for (const table of ["disponibilities", "suggestions"]) {
-    if (!hasColumn(table, "generator_id")) {
-    this.connection.exec(`ALTER TABLE ${table} ADD COLUMN generator_id INTEGER REFERENCES generators(id) ON DELETE SET NULL`);
-    this.connection.exec(`ALTER TABLE ${table} ADD COLUMN generator_occurrence TEXT`);
-    this.connection.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_generator ON ${table}(generator_id, generator_occurrence)`);
-    }
   }
   if (!hasColumn("rooms", "position")) {
     this.connection.exec("ALTER TABLE rooms ADD COLUMN position INTEGER NOT NULL DEFAULT 0");
