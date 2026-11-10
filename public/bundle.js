@@ -3908,6 +3908,63 @@ var Calendar = class {
 		else this.prev();
 	}
 };
+/** A Monday (local time): the "Habitudes" page draws this week, whatever the real date. */
+var HABIT_WEEK = new Date(2001, 0, 1);
+/**
+* Week template of the "Habitudes" page: one fixed reference week, days shown by name only (no dates).
+* Navigation (one day at a time on a phone) wraps inside that week; the weekday of a column is all that matters.
+*/
+var HabitCalendar = class extends Calendar {
+	constructor() {
+		super();
+		this.anchor = new Date(HABIT_WEEK);
+	}
+	get count() {
+		return this.isMobile ? 1 : 7;
+	}
+	get step() {
+		return this.isMobile ? 1 : 7;
+	}
+	get first() {
+		if (this.isMobile) return startOfDay(this.anchor);
+		const a = startOfDay(HABIT_WEEK);
+		return addDays(a, -((a.getDay() - this.settings.firstDay + 7) % 7));
+	}
+	get title() {
+		if (!this.isMobile) return "Semaine type";
+		const day = this.longDay(this.first);
+		return day.charAt(0).toUpperCase() + day.slice(1);
+	}
+	/** Same weekday, inside the reference week. */
+	wrap(d) {
+		const base = startOfDay(HABIT_WEEK);
+		return addDays(base, (Math.round((startOfDay(d).getTime() - base.getTime()) / 864e5) % 7 + 7) % 7);
+	}
+	prev() {
+		this.anchor = this.wrap(addDays(this.anchor, -1));
+		this.onRange?.();
+	}
+	next() {
+		this.anchor = this.wrap(addDays(this.anchor, 1));
+		this.onRange?.();
+	}
+	today() {
+		this.anchor = this.wrap(/* @__PURE__ */ new Date());
+		this.onRange?.();
+	}
+	/** The column of today's weekday is highlighted, with the "now" line. */
+	isToday(d) {
+		return d.getDay() === this.now.getDay();
+	}
+	longDay(d) {
+		return d.toLocaleDateString("fr-FR", { weekday: "long" });
+	}
+	nowMin(day) {
+		if (!this.isToday(day)) return null;
+		const m = this.now.getHours() * 60 + this.now.getMinutes() - this.settings.startHour * 60;
+		return m >= 0 && m <= this.hours.length * 60 ? m : null;
+	}
+};
 //#endregion
 //#region client/src/Results.ts
 var STATE_LABEL = {
@@ -4144,7 +4201,8 @@ var ResultsView = class {
 		return Date.parse(a.start) - Date.parse(b.start) || a.id - b.id;
 	}
 	row(m, a, now) {
-		const hours = m.durationMinutes / 60;
+		const minutes = m.actualDurationMinutes ?? m.durationMinutes;
+		const hours = minutes / 60;
 		let rate, paid = 0, society = 0, share;
 		if (this.isAdmin) {
 			const price = (m.hourlyRate ?? 0) * hours;
@@ -4162,7 +4220,8 @@ var ResultsView = class {
 			agent: person(a.agent) || "Agent",
 			consumer: person(a.consumer) || "Consommateur",
 			start: m.startAt,
-			minutes: m.durationMinutes,
+			minutes,
+			plannedMinutes: m.durationMinutes,
 			hours,
 			status: m.status,
 			state: meetingState(m, now),
@@ -4488,11 +4547,28 @@ var Fetcher = class {
 	createMeeting(b) {
 		return this.post("/api/meetings/from-availability", b);
 	}
+	/** status "done" validates the meeting; actualDurationMinutes is then the time really spent (default: the booked duration). */
 	patchMeeting(id, b) {
 		return this.patch(`/api/meetings/${id}`, b);
 	}
 	cancelMeeting(id) {
 		return this.post(`/api/meetings/${id}/cancel`);
+	}
+	createGenerator(b) {
+		return this.post("/api/generators", b);
+	}
+	updateGenerator(id, b) {
+		return this.patch(`/api/generators/${id}`, b);
+	}
+	deleteGenerator(id) {
+		return this.del(`/api/generators/${id}`);
+	}
+	/** Cancels one occurrence ("cancelator"), by its local date YYYY-MM-DD. */
+	cancelOccurrence(id, occurrence) {
+		return this.post(`/api/generators/${id}/cancellations`, { occurrence });
+	}
+	restoreOccurrence(id, occurrence) {
+		return this.del(`/api/generators/${id}/cancellations/${encodeURIComponent(occurrence)}`);
 	}
 	script() {
 		return this.get("/api/agent/script");
@@ -4660,6 +4736,114 @@ function evaluate(chosen) {
 	return new Set(chosen.map((c) => c.assignationId)).size * NEW_CONSUMER_BONUS + chosen.reduce((sum, c) => sum + c.score, 0);
 }
 //#endregion
+//#region shared/recurrence.ts
+var DAY_MS = 864e5;
+var DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+var WEEKDAYS_FR = [
+	"dimanche",
+	"lundi",
+	"mardi",
+	"mercredi",
+	"jeudi",
+	"vendredi",
+	"samedi"
+];
+var formatters = /* @__PURE__ */ new Map();
+function formatter(timeZone) {
+	let f = formatters.get(timeZone);
+	if (!f) {
+		f = new Intl.DateTimeFormat("en-US", {
+			timeZone,
+			hourCycle: "h23",
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit"
+		});
+		formatters.set(timeZone, f);
+	}
+	return f;
+}
+function isValidTimeZone(timeZone) {
+	if (typeof timeZone !== "string" || !timeZone || timeZone.length > 64) return false;
+	try {
+		formatter(timeZone);
+		return true;
+	} catch {
+		return false;
+	}
+}
+/** Wall-clock parts of an instant in a time zone. */
+function parts(ms, timeZone) {
+	const p = {};
+	for (const x of formatter(timeZone).formatToParts(new Date(ms))) if (x.type !== "literal") p[x.type] = Number(x.value);
+	return {
+		y: p.year,
+		m: p.month,
+		d: p.day,
+		h: p.hour % 24,
+		min: p.minute,
+		s: p.second
+	};
+}
+/** Offset (ms) of the time zone at an instant: local wall clock - UTC. */
+function offset(ms, timeZone) {
+	const p = parts(ms, timeZone);
+	return Date.UTC(p.y, p.m - 1, p.d, p.h, p.min, p.s) - Math.floor(ms / 1e3) * 1e3;
+}
+/** Local date (YYYY-MM-DD) of an instant in a time zone. */
+function localDate(ms, timeZone) {
+	const p = parts(ms, timeZone);
+	return `${p.y}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}`;
+}
+/** Instant of a wall-clock time (date + minutes after midnight) in a time zone. */
+function zonedTime(date, minutes, timeZone) {
+	const [y, m, d] = date.split("-").map(Number);
+	const guess = Date.UTC(y, m - 1, d, 0, minutes);
+	return guess - offset(guess - offset(guess, timeZone), timeZone);
+}
+/** Days since 1970-01-01 of a YYYY-MM-DD date. */
+var dayNumber = (date) => {
+	const [y, m, d] = date.split("-").map(Number);
+	return Math.round(Date.UTC(y, m - 1, d) / DAY_MS);
+};
+var fromDayNumber = (n) => (/* @__PURE__ */ new Date(n * DAY_MS)).toISOString().slice(0, 10);
+/**
+* Occurrences whose start is in [from, to), in chronological order.
+* Cancellations are not applied here (the caller knows them).
+*/
+function occurrences(r, from, to) {
+	if (!(to > from) || !isValidTimeZone(r.timeZone) || !DATE_RE.test(r.startsOn)) return [];
+	const startsOn = dayNumber(r.startsOn);
+	const anchor = startsOn + (r.weekday - (/* @__PURE__ */ new Date(startsOn * DAY_MS)).getUTCDay() + 7) % 7;
+	const step = Math.max(1, r.intervalWeeks) * 7;
+	const last = r.endsOn && DATE_RE.test(r.endsOn) ? dayNumber(r.endsOn) : Infinity;
+	let day = Math.max(anchor, dayNumber(localDate(from, r.timeZone)) - 1);
+	day = anchor + Math.ceil((day - anchor) / step) * step;
+	const out = [];
+	const lastDay = Math.min(last, dayNumber(localDate(to, r.timeZone)) + 1);
+	for (; day <= lastDay; day += step) {
+		const date = fromDayNumber(day);
+		const start = zonedTime(date, r.startMinute, r.timeZone);
+		if (start < from) continue;
+		if (start >= to) break;
+		out.push({
+			date,
+			start,
+			end: start + r.durationMinutes * 6e4
+		});
+	}
+	return out;
+}
+/** "Chaque lundi" / "Toutes les 2 semaines, le lundi" + time range. */
+function describe(r) {
+	const t = (m) => `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+	const day = WEEKDAYS_FR[r.weekday] ?? "?";
+	return `${r.intervalWeeks > 1 ? `Toutes les ${r.intervalWeeks} semaines, le ${day}` : `Chaque ${day}`}, ${t(r.startMinute)} – ${t(r.startMinute + r.durationMinutes)}`;
+}
+//#endregion
 //#region client/src/domHandler.ts
 /** Required role per page (null = public page). */
 var PAGES = {
@@ -4681,12 +4865,14 @@ var PAGES = {
 	"agent-companies": "agent",
 	"agent-consumers": "agent",
 	"agent-agenda": "agent",
+	"agent-habits": "agent",
 	"agent-results": "agent",
 	"agent-script": "agent",
 	"consumer-welcome": null,
 	"consumer-access": null,
 	"consumer-dashboard": "consumer",
-	"consumer-agenda": "consumer"
+	"consumer-agenda": "consumer",
+	"consumer-habits": "consumer"
 };
 /** Period wide enough to get every meeting, whatever its date (results pages). */
 var ALL_FROM = "2000-01-01T00:00:00.000Z";
@@ -4747,6 +4933,32 @@ var RUN_STATUS = {
 	timeout: "Temps dépassé",
 	skipped: "Ignoré"
 };
+/** Temporary id of a row created on screen before the server answered (real ids are positive). */
+var tempId = () => -1 - Math.floor(Math.random() * 1e9);
+/** Time zone of the browser: the repetitions keep their wall-clock time in it. */
+var browserTimeZone = () => {
+	try {
+		return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+	} catch {
+		return "UTC";
+	}
+};
+var hhmm = (minutes) => `${String(Math.floor(minutes / 60) % 24).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+/** Form of the "Répétition automatique" section. */
+var newGenForm = () => {
+	const today = /* @__PURE__ */ new Date();
+	return {
+		id: null,
+		weekday: today.getDay(),
+		start: "09:00",
+		duration: 120,
+		love: .5,
+		intervalWeeks: 1,
+		startsOn: localDate(today.getTime(), browserTimeZone()),
+		endsOn: "",
+		contractId: null
+	};
+};
 var uid = () => crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 var horizon = (days) => ({
 	from: (/* @__PURE__ */ new Date()).toISOString(),
@@ -4761,6 +4973,7 @@ var raw = new class DomHandler {
 		this.company = null;
 		this.busy = false;
 		this.loading = false;
+		this.syncing = 0;
 		this.error = "";
 		this.notice = "";
 		this.flash = "";
@@ -4815,7 +5028,20 @@ var raw = new class DomHandler {
 			value: ""
 		};
 		this.openRun = null;
+		this.generators = [];
+		this.otherGenerators = [];
+		this.habitCal = new HabitCalendar();
+		this.habitToEdit = null;
+		this.rangeLoaded = false;
+		this.virtualDispos = [];
+		this.virtualSuggestions = [];
+		this.doneEdit = null;
 		this.cal = new Calendar();
+		this.agendaSeq = 0;
+		this.loadedRange = "";
+		this.syncChain = Promise.resolve();
+		this.resyncWanted = false;
+		this.lastButton = null;
 	}
 	/** Alpine looks methods up on own properties: bind them to the reactive proxy. */
 	bindAll(self) {
@@ -4831,6 +5057,13 @@ var raw = new class DomHandler {
 			this.go("main");
 		};
 		window.addEventListener("hashchange", () => void this.route());
+		document.addEventListener("click", (e) => {
+			const el = e.target?.closest?.("button");
+			this.lastButton = el ? {
+				el,
+				at: Date.now()
+			} : null;
+		}, true);
 		module_default.directive("place", (el, { expression }, { evaluate, effect }) => {
 			effect(() => {
 				const vars = evaluate(expression);
@@ -4894,6 +5127,15 @@ var raw = new class DomHandler {
 			meetingId: "",
 			last: null
 		};
+		this.generators = [];
+		this.otherGenerators = [];
+		this.habitCal.events = [];
+		this.habitToEdit = null;
+		this.virtualDispos = [];
+		this.virtualSuggestions = [];
+		this.rangeLoaded = false;
+		this.loadedRange = "";
+		this.doneEdit = null;
 	}
 	async logout() {
 		try {
@@ -4920,6 +5162,7 @@ var raw = new class DomHandler {
 		this.created = null;
 		this.panel = null;
 		this.results = [];
+		this.doneEdit = null;
 		this.notice = "";
 		this.error = this.flash;
 		this.flash = "";
@@ -4951,6 +5194,8 @@ var raw = new class DomHandler {
 		this.error = "";
 		this.notice = "";
 		if (this.panel) this.panel.error = "";
+		const button = this.lastButton && Date.now() - this.lastButton.at < 1e3 ? this.lastButton.el : null;
+		button?.setAttribute("aria-busy", "true");
 		try {
 			await fn();
 			if (ok) this.notice = ok;
@@ -4960,6 +5205,68 @@ var raw = new class DomHandler {
 			else this.error = msg;
 		} finally {
 			this.busy = false;
+			button?.removeAttribute("aria-busy");
+		}
+	}
+	/**
+	* Optimistic change, for what the browser can guess without the server: `apply` changes the screen at once and
+	* returns how to undo it, `send` talks to the server in the background. Sends run one after the other, in order.
+	* If the server refuses, the change is undone and the error shown. Once nothing is left to send, the page data is
+	* reloaded quietly (no spinner) so the screen matches the server (remaining hours, generated rows…).
+	*/
+	optimistic(apply, send, ok = "") {
+		this.error = "";
+		this.notice = "";
+		const page = this.page;
+		const undo = apply();
+		this.redraw();
+		this.syncing += 1;
+		const task = this.syncChain.then(send).then(() => {
+			if (ok && this.page === page) this.notice = ok;
+		}, (e) => {
+			undo?.();
+			if (this.page === page) this.error = e?.message ?? "Une erreur est survenue : la modification a été annulée.";
+		}).finally(() => {
+			this.syncing -= 1;
+			this.resyncWanted = true;
+			this.redraw();
+			if (!this.syncing && this.resyncWanted && this.page === page) {
+				this.resyncWanted = false;
+				this.quietReload();
+			}
+		});
+		this.syncChain = task;
+		return task;
+	}
+	/** Rebuilds what is drawn from the data (the calendar is not reactive to the arrays it is built from). */
+	redraw() {
+		if (this.page === "agent-agenda" || this.page === "consumer-agenda") this.cal.events = this.buildEvents();
+		if (this.page === "agent-habits" || this.page === "consumer-habits") this.habitCal.events = this.buildHabitEvents();
+	}
+	/** Reloads the data of the page without any spinner (after optimistic changes). */
+	async quietReload() {
+		try {
+			if (this.page === "agent-agenda" || this.page === "consumer-agenda") await this.refreshAgenda(true);
+			else if (this.page === "agent-habits" || this.page === "consumer-habits") await this.loadHabits();
+			else if (this.page === "admin-results" || this.page === "agent-results") await this.reloadResults();
+			else if (this.page === "admin-dashboard") {
+				const { from, to } = horizon(14);
+				this.meetings = (await fetcher.agenda(from, to)).meetings ?? [];
+			}
+		} catch {}
+	}
+	/** Runs synchronous checks of a form; the message goes to the panel (or the page) and false is returned. */
+	check(fn) {
+		this.error = "";
+		if (this.panel) this.panel.error = "";
+		try {
+			fn();
+			return true;
+		} catch (e) {
+			const msg = e?.message ?? "Valeur invalide.";
+			if (this.panel) this.panel.error = msg;
+			else this.error = msg;
+			return false;
 		}
 	}
 	async load(fn) {
@@ -5084,6 +5391,8 @@ var raw = new class DomHandler {
 					this.meetings = (agenda.meetings ?? []).slice().sort((a, b) => Date.parse(b.startAt) - Date.parse(a.startAt));
 					this.assignations = agenda.assignations ?? [];
 				});
+			case "agent-habits":
+			case "consumer-habits": return this.openHabits();
 			case "agent-agenda":
 			case "consumer-agenda": return this.openAgenda();
 		}
@@ -5303,15 +5612,21 @@ var raw = new class DomHandler {
 	}
 	/** Admin dashboard: give (or remove) the room of an upcoming meeting. */
 	async setMeetingRoom(m, select) {
-		await this.run(async () => {
-			try {
-				await fetcher.patchMeeting(m.id, { roomName: select.value || null });
-			} catch (e) {
-				select.value = m.roomName ?? "";
-				throw e;
-			}
-			const { from, to } = horizon(14);
-			this.meetings = (await fetcher.agenda(from, to)).meetings ?? [];
+		const id = m.id, before = m.roomName ?? null, roomName = select.value || null;
+		await this.optimistic(() => {
+			this.meetings = this.meetings.map((x) => x.id === id ? {
+				...x,
+				roomName
+			} : x);
+			return () => {
+				this.meetings = this.meetings.map((x) => x.id === id ? {
+					...x,
+					roomName: before
+				} : x);
+				select.value = before ?? "";
+			};
+		}, async () => {
+			await fetcher.patchMeeting(id, { roomName });
 		}, "Salle mise à jour.");
 	}
 	scriptEventLabel(t) {
@@ -5712,24 +6027,53 @@ var raw = new class DomHandler {
 		const a = await fetcher.agenda(ALL_FROM, ALL_TO);
 		this.res.setData(this.res.mode, a.meetings ?? [], this.res.assignations);
 	}
-	/** The only changes allowed from the results: validate, cancel or comment a pending meeting. */
-	async resultDone(id) {
-		await this.run(async () => {
-			await fetcher.patchMeeting(id, { status: "done" });
-			await this.reloadResults();
+	/** Changes one meeting of the results on screen; returns how to undo it. */
+	patchResult(id, change) {
+		const before = this.res.meetings.find((m) => m.id === id);
+		this.res.setData(this.res.mode, this.res.meetings.map((m) => m.id === id ? {
+			...m,
+			...change
+		} : m), this.res.assignations);
+		return () => {
+			if (before) this.res.setData(this.res.mode, this.res.meetings.map((m) => m.id === id ? before : m), this.res.assignations);
+		};
+	}
+	/** The only changes allowed from the results: validate (with the duration really spent), cancel or comment a pending meeting. */
+	resultDone(id) {
+		const m = this.res.meetings.find((x) => x.id === id);
+		this.doneEdit = {
+			id,
+			minutes: m?.durationMinutes ?? 60
+		};
+	}
+	async resultConfirmDone() {
+		const edit = this.doneEdit;
+		if (!edit) return;
+		const minutes = Number(edit.minutes);
+		if (!this.check(() => {
+			if (!Number.isInteger(minutes) || minutes <= 0) throw new Error("La durée réelle est un nombre entier de minutes, supérieur à 0.");
+		})) return;
+		this.doneEdit = null;
+		const actual = minutes === this.res.meetings.find((x) => x.id === edit.id)?.durationMinutes ? null : minutes;
+		await this.optimistic(() => this.patchResult(edit.id, {
+			status: "done",
+			actualDurationMinutes: actual
+		}), async () => {
+			await fetcher.patchMeeting(edit.id, {
+				status: "done",
+				actualDurationMinutes: actual
+			});
 		}, "Rendez-vous marqué comme terminé.");
 	}
 	async resultCancel(id) {
 		if (!confirm("Annuler ce rendez-vous ?")) return;
-		await this.run(async () => {
+		await this.optimistic(() => this.patchResult(id, { status: "canceledBy" }), async () => {
 			await fetcher.cancelMeeting(id);
-			await this.reloadResults();
 		}, "Rendez-vous annulé.");
 	}
 	async resultComment(id, text) {
-		await this.run(async () => {
+		await this.optimistic(() => this.patchResult(id, { comment: text }), async () => {
 			await fetcher.patchMeeting(id, { comment: text });
-			await this.reloadResults();
 		}, "Commentaire enregistré.");
 	}
 	/** Example shown under the field: what a 32 EUR price becomes for the agent and for the company. */
@@ -5767,34 +6111,62 @@ var raw = new class DomHandler {
 		this.cal.attach(() => void this.refreshAgenda());
 		await this.refreshAgenda();
 	}
-	async refreshAgenda() {
-		await this.load(async () => {
-			const { from, to } = this.cal.range;
+	/**
+	* Loads the visible period. Until the answer arrives, the period is drawn from the generators already known
+	* (weekly repetitions), so changing week shows the usual hours at once. `silent` reloads without the spinner.
+	*/
+	async refreshAgenda(silent = false) {
+		const { from, to } = this.cal.range;
+		const key = `${this.selAssign}|${from}|${to}`;
+		const seq = ++this.agendaSeq;
+		if (key !== this.loadedRange) {
+			this.rangeLoaded = false;
+			this.cal.events = this.buildEvents();
+		}
+		const work = async () => {
 			const a = await fetcher.agenda(from, to);
-			this.meetings = a.meetings ?? [];
+			if (seq !== this.agendaSeq) return;
+			const meetings = a.meetings ?? [];
+			let dispos = [];
 			if (this.role === "agent") {
+				let rooms;
+				[dispos, rooms] = await Promise.all([fetcher.disponibilities({
+					from,
+					to
+				}), fetcher.rooms()]);
+				if (seq !== this.agendaSeq) return;
 				this.contracts = a.contracts ?? [];
 				this.assignations = a.assignations ?? [];
 				this.suggestions = a.suggestions ?? [];
 				this.requests = (a.requests ?? []).map(normRequest);
 				this.intercoursePairs = a.intercoursePairs ?? [];
-				[this.dispos, this.rooms] = await Promise.all([fetcher.disponibilities({
-					from,
-					to
-				}), fetcher.rooms()]);
+				this.generators = a.generators ?? [];
+				this.otherGenerators = a.consumerGenerators ?? [];
+				this.rooms = rooms;
 			} else {
 				this.agentsList = a.agents ?? [];
 				this.requests = (a.requests ?? []).map(normRequest);
 				this.slots = a.agentSlots ?? [];
+				this.generators = a.generators ?? [];
+				this.otherGenerators = a.agentGenerators ?? [];
 				if (this.selAssign === null && this.agentsList.length) this.selAssign = this.assignId(this.agentsList[0]);
-				this.dispos = this.selAssign ? await fetcher.disponibilities({
+				dispos = this.selAssign ? await fetcher.disponibilities({
 					assignationId: this.selAssign,
 					from,
 					to
 				}) : [];
+				if (seq !== this.agendaSeq) return;
 			}
+			this.meetings = meetings;
+			this.dispos = dispos;
+			this.loadedRange = `${this.selAssign}|${from}|${to}`;
+			this.rangeLoaded = true;
 			this.cal.events = this.buildEvents();
-		});
+		};
+		if (!silent) return this.load(work);
+		try {
+			await work();
+		} catch {}
 	}
 	/** Agent of one of my assignations (consumer side). */
 	agentOf(assignationId) {
@@ -5811,7 +6183,13 @@ var raw = new class DomHandler {
 			s: Date.parse(x.startAt),
 			e: Date.parse(x.startAt) + x.durationMinutes * 6e4
 		});
-		const meetings = this.meetings.filter((m) => m.status !== "canceledBy");
+		this.buildVirtual();
+		const { from, to } = this.cal.range;
+		const inRange = (x) => {
+			const { s, e } = span(x);
+			return e > Date.parse(from) && s < Date.parse(to);
+		};
+		const meetings = this.meetings.filter((m) => m.status !== "canceledBy" && (this.rangeLoaded || inRange(m)));
 		this.cal.gaps = this.role === "agent" ? this.buildGaps(meetings) : [];
 		const busy = meetings.map(span).sort((a, b) => a.s - b.s);
 		const mk = (kind, x, title, editable = false, status, s = span(x).s, e = span(x).e) => ({
@@ -5819,11 +6197,13 @@ var raw = new class DomHandler {
 			kind,
 			title,
 			status,
-			editable,
+			editable: editable && !x._pending && !x.virtual,
 			love: x.love,
 			raw: x,
 			start: new Date(s),
-			end: new Date(e)
+			end: new Date(e),
+			virtual: !!x.virtual,
+			pending: !!x._pending
 		});
 		const cut = (kind, x, title, editable = false) => {
 			const out = [];
@@ -5838,6 +6218,7 @@ var raw = new class DomHandler {
 		};
 		const out = [];
 		const agent = this.role === "agent";
+		const rows = (list) => this.rangeLoaded ? list : list.filter((x) => x._pending);
 		for (const m of meetings) out.push(mk("meeting", m, agent ? this.who(m.assignationId) : this.agentOf(m.assignationId), false, m.status));
 		if (agent) {
 			for (const p of this.proposals) out.push({
@@ -5848,17 +6229,407 @@ var raw = new class DomHandler {
 				start: p.start,
 				end: p.end
 			});
-			for (const s of this.suggestions) out.push(...cut("suggestion", s, "Mes horaires", true));
-			for (const d of this.dispos) if (this.isVisible(d.assignationId)) out.push(...cut("dispo", d, this.who(d.assignationId)));
+			for (const s of [...rows(this.suggestions), ...this.virtualSuggestions]) out.push(...cut("suggestion", s, "Mes horaires", true));
+			for (const d of [...rows(this.dispos), ...this.virtualDispos]) if (this.isVisible(d.assignationId)) out.push(...cut("dispo", d, this.who(d.assignationId)));
 		} else {
-			for (const s of this.slots) {
+			for (const s of [...rows(this.slots), ...this.virtualSuggestions]) {
 				const target = s.assignationId;
 				if (this.selAssign !== null && target !== void 0 && target !== this.selAssign) continue;
 				out.push(...cut("slot", s, this.agentOf(target ?? this.selAssign)));
 			}
-			for (const d of this.dispos) out.push(...cut("dispo", d, "Ma disponibilité", true));
+			for (const d of [...rows(this.dispos), ...this.virtualDispos]) out.push(...cut("dispo", d, "Ma disponibilité", true));
 		}
 		return out;
+	}
+	/**
+	* Occurrences of the generators in the visible period that are not real rows: the ones after the period the
+	* server already generated (two weeks), or every one while the period is loading. Cancelled ones are skipped.
+	*/
+	buildVirtual() {
+		const { from, to } = this.cal.range;
+		const now = Date.now();
+		const lo = Math.max(Date.parse(from), now);
+		const hi = Date.parse(to);
+		const rowsOf = (g) => g.kind === "suggestion" ? this.role === "agent" ? this.suggestions : this.slots : this.dispos;
+		const make = (g, assignationId) => {
+			if (hi <= lo) return [];
+			const cancelled = new Set(g.cancellations);
+			const generated = Date.parse(g.generatedUntil);
+			const real = new Set(rowsOf(g).filter((r) => r.generatorId === g.id).map((r) => r.generatorOccurrence));
+			return occurrences(g, lo, hi).filter((o) => !cancelled.has(o.date) && !real.has(o.date) && (!this.rangeLoaded || o.start >= generated)).map((o) => ({
+				id: `g${g.id}-${o.date}`,
+				virtual: true,
+				_pending: g._pending,
+				generatorId: g.id,
+				generatorOccurrence: o.date,
+				startAt: new Date(o.start).toISOString(),
+				durationMinutes: g.durationMinutes,
+				love: g.love,
+				contractId: g.contractId,
+				assignationId,
+				requestId: g.requestId ?? null
+			}));
+		};
+		if (this.role === "agent") {
+			this.virtualSuggestions = this.generators.flatMap((g) => make(g, null));
+			this.virtualDispos = this.otherGenerators.flatMap((g) => make(g, g.assignationId));
+		} else {
+			this.virtualDispos = this.generators.filter((g) => g.assignationId === this.selAssign).flatMap((g) => make(g, g.assignationId));
+			this.virtualSuggestions = this.otherGenerators.filter((g) => g.assignationId === this.selAssign).flatMap((g) => make(g, g.assignationId));
+		}
+	}
+	generatorOf(id) {
+		return id == null ? void 0 : [...this.generators, ...this.otherGenerators].find((g) => g.id === id);
+	}
+	describeGenerator(g) {
+		return g ? describe(g) : "";
+	}
+	weekdayLabel(n) {
+		return WEEKDAYS_FR[n] ?? "";
+	}
+	weekdays() {
+		return [
+			1,
+			2,
+			3,
+			4,
+			5,
+			6,
+			0
+		].map((value) => ({
+			value,
+			label: WEEKDAYS_FR[value]
+		}));
+	}
+	/** My generators shown in the section: the consumer only sees those of the agent selected. */
+	myGenerators() {
+		return this.role === "consumer" ? this.generators.filter((g) => g.assignationId === this.selAssign) : this.generators;
+	}
+	/** Period of a generator, for the list ("depuis le …, jusqu'au …"). */
+	generatorPeriod(g) {
+		const f = (d) => (/* @__PURE__ */ new Date(`${d}T12:00`)).toLocaleDateString("fr-FR", {
+			day: "numeric",
+			month: "short",
+			year: "numeric"
+		});
+		const tz = g.timeZone !== browserTimeZone() ? ` (heure de ${g.timeZone})` : "";
+		return `à partir du ${f(g.startsOn)}${g.endsOn ? `, jusqu’au ${f(g.endsOn)}` : ""}${tz}`;
+	}
+	/** Cancelled occurrences still to come (the past ones do not matter any more). */
+	futureCancellations(g) {
+		const today = localDate(Date.now(), g.timeZone);
+		return g.cancellations.filter((d) => d >= today);
+	}
+	occurrenceLabel(date) {
+		return (/* @__PURE__ */ new Date(`${date}T12:00`)).toLocaleDateString("fr-FR", {
+			weekday: "short",
+			day: "numeric",
+			month: "short"
+		});
+	}
+	/** From the agenda: opens the habit in the "Habitudes" page. */
+	editGenerator(g) {
+		this.closePanel();
+		if (this.page.endsWith("-habits")) return this.openHabit(g);
+		this.habitToEdit = g.id;
+		this.go(this.role === "agent" ? "agent-habits" : "consumer-habits");
+	}
+	async openHabits() {
+		this.habitCal.onSelect = (s, e) => this.newHabit(s, e);
+		this.habitCal.selection = null;
+		this.habitCal.attach(() => {
+			this.habitCal.events = this.buildHabitEvents();
+		});
+		await this.load(() => this.loadHabits());
+		const id = this.habitToEdit;
+		this.habitToEdit = null;
+		const g = this.generators.find((x) => x.id === id);
+		if (g) this.openHabit(g);
+	}
+	/** The habits come with the agenda; a one-minute period is enough (no row is needed here). */
+	async loadHabits() {
+		const now = /* @__PURE__ */ new Date();
+		const a = await fetcher.agenda(now.toISOString(), new Date(now.getTime() + 6e4).toISOString());
+		this.requests = (a.requests ?? []).map(normRequest);
+		this.generators = a.generators ?? [];
+		if (this.role === "agent") {
+			this.contracts = a.contracts ?? [];
+			this.assignations = a.assignations ?? [];
+			this.otherGenerators = a.consumerGenerators ?? [];
+		} else {
+			this.agentsList = a.agents ?? [];
+			this.otherGenerators = a.agentGenerators ?? [];
+			if (this.selAssign === null && this.agentsList.length) this.selAssign = this.assignId(this.agentsList[0]);
+		}
+		this.habitCal.events = this.buildHabitEvents();
+	}
+	/**
+	* One block per habit, on the column of its weekday. Mine can be edited; the other side's are shown for reference
+	* (the agent sees his consumers' habits, filtered like in the agenda; the consumer sees his agent's hours).
+	*/
+	buildHabitEvents() {
+		const days = this.habitCal.days;
+		const out = [];
+		const add = (g, kind, title, editable) => {
+			for (const day of days.filter((d) => d.getDay() === g.weekday)) {
+				const start = new Date(day);
+				start.setHours(0, g.startMinute, 0, 0);
+				const every = g.intervalWeeks > 1 ? ` · toutes les ${g.intervalWeeks} sem.` : "";
+				out.push({
+					id: `habit-${g.id}-${day.getDay()}`,
+					kind,
+					title: title + every,
+					love: g.love,
+					editable,
+					raw: g,
+					start,
+					end: new Date(start.getTime() + g.durationMinutes * 6e4),
+					pending: !!g._pending
+				});
+			}
+		};
+		if (this.role === "agent") {
+			for (const g of this.generators) add(g, "suggestion", "Mes horaires", true);
+			for (const g of this.otherGenerators) if (g.assignationId !== null && this.isVisible(g.assignationId)) add(g, "dispo", this.who(g.assignationId), false);
+		} else {
+			for (const g of this.myGenerators()) add(g, "dispo", "Ma disponibilité", true);
+			for (const g of this.otherGenerators) if (g.assignationId === this.selAssign) add(g, "slot", this.agentOf(g.assignationId), false);
+		}
+		return out;
+	}
+	/** A slot drawn on the week template: new habit on that weekday, at that time. */
+	newHabit(start, end) {
+		if (this.role === "consumer" && this.selAssign === null) {
+			this.habitCal.selection = null;
+			this.error = "Aucun agent ne vous est assigné.";
+			return;
+		}
+		if (this.role === "agent" && !this.contracts.length) {
+			this.habitCal.selection = null;
+			this.error = "Aucun contrat actif : demandez à votre administrateur.";
+			return;
+		}
+		this.error = "";
+		this.panel = {
+			type: "habit",
+			error: "",
+			gen: null,
+			form: {
+				...newGenForm(),
+				weekday: start.getDay(),
+				start: hhmm(start.getHours() * 60 + start.getMinutes()),
+				duration: Math.max(15, Math.round((end.getTime() - start.getTime()) / 6e4)),
+				contractId: this.contracts[0]?.id ?? null
+			}
+		};
+	}
+	/** Keyboard / touch fallback: a new habit today at 9:00. */
+	openNewHabit() {
+		const s = /* @__PURE__ */ new Date();
+		s.setHours(9, 0, 0, 0);
+		this.newHabit(s, new Date(s.getTime() + 2 * 36e5));
+	}
+	openHabitEvent(ev) {
+		if (ev.pending) {
+			this.error = "Enregistrement en cours… réessayez dans un instant.";
+			return;
+		}
+		if (!ev.editable) {
+			this.panel = {
+				type: "habit-info",
+				ev,
+				error: ""
+			};
+			return;
+		}
+		this.openHabit(ev.raw);
+	}
+	openHabit(g) {
+		this.error = "";
+		this.panel = {
+			type: "habit",
+			error: "",
+			gen: g,
+			form: {
+				id: g.id,
+				weekday: g.weekday,
+				start: hhmm(g.startMinute),
+				duration: g.durationMinutes,
+				love: g.love ?? .5,
+				intervalWeeks: g.intervalWeeks,
+				startsOn: g.startsOn,
+				endsOn: g.endsOn ?? "",
+				contractId: g.contractId
+			}
+		};
+	}
+	async submitHabit() {
+		const form = this.panel.form;
+		let ok = false;
+		this.check(() => {
+			this.generatorBody(form);
+			ok = true;
+		});
+		if (!ok) return;
+		this.closePanel();
+		await this.saveGenerator(form);
+	}
+	generatorBody(f) {
+		const [h, m] = String(f.start).split(":").map(Number);
+		const duration = Number(f.duration), love = Number(f.love), interval = Number(f.intervalWeeks);
+		if (!Number.isInteger(h) || !Number.isInteger(m)) throw new Error("L’heure de début est invalide.");
+		if (!Number.isInteger(duration) || duration <= 0 || duration > 1440) throw new Error("La durée est un nombre entier de minutes, 24 h au plus.");
+		if (!(love >= 0 && love <= 1)) throw new Error("La préférence doit être comprise entre 0 et 1.");
+		if (!Number.isInteger(interval) || interval < 1 || interval > 52) throw new Error("La fréquence est comprise entre 1 et 52 semaines.");
+		if (!f.startsOn) throw new Error("Indiquez la date de début.");
+		if (f.endsOn && f.endsOn < f.startsOn) throw new Error("La date de fin doit être après la date de début.");
+		const body = {
+			weekday: Number(f.weekday),
+			startMinute: h * 60 + m,
+			durationMinutes: duration,
+			love,
+			intervalWeeks: interval,
+			timeZone: browserTimeZone(),
+			startsOn: f.startsOn,
+			endsOn: f.endsOn || null
+		};
+		if (this.role === "agent") {
+			const contractId = Number(f.contractId ?? this.contracts[0]?.id);
+			if (!contractId) throw new Error("Aucun contrat actif : demandez à votre administrateur.");
+			body.contractId = contractId;
+		} else {
+			if (this.selAssign === null) throw new Error("Aucun agent ne vous est assigné.");
+			body.assignationId = this.selAssign;
+			const request = this.currentRequest();
+			if (request) body.requestId = request.id;
+		}
+		return body;
+	}
+	/** Rows generated by a generator that are still to come (removed by the server when the rule changes). */
+	dropFutureRows(id) {
+		const now = Date.now();
+		const keep = (r) => r.generatorId !== id || Date.parse(r.startAt) <= now;
+		const before = {
+			dispos: this.dispos,
+			suggestions: this.suggestions
+		};
+		this.dispos = this.dispos.filter(keep);
+		this.suggestions = this.suggestions.filter(keep);
+		return () => {
+			this.dispos = before.dispos;
+			this.suggestions = before.suggestions;
+		};
+	}
+	/** Creates or changes a habit (generator), from the "Habitudes" page or the "repeat" box of the agenda. */
+	async saveGenerator(form) {
+		let body;
+		if (!this.check(() => {
+			body = this.generatorBody(form);
+		})) return;
+		const id = form.id;
+		const local = (base = {}) => ({
+			...base,
+			id: id ?? tempId(),
+			kind: this.role === "agent" ? "suggestion" : "disponibility",
+			contractId: body.contractId ?? null,
+			assignationId: body.assignationId ?? null,
+			requestId: body.requestId ?? null,
+			weekday: body.weekday,
+			startMinute: body.startMinute,
+			durationMinutes: body.durationMinutes,
+			love: body.love,
+			intervalWeeks: body.intervalWeeks,
+			timeZone: body.timeZone,
+			startsOn: body.startsOn,
+			endsOn: body.endsOn,
+			generatedUntil: (/* @__PURE__ */ new Date()).toISOString(),
+			cancellations: base.cancellations ?? [],
+			_pending: true
+		});
+		if (id === null) {
+			const tmp = local();
+			await this.optimistic(() => {
+				this.generators = [...this.generators, tmp];
+				return () => {
+					this.generators = this.generators.filter((g) => g.id !== tmp.id);
+				};
+			}, async () => {
+				const saved = await fetcher.createGenerator(body);
+				this.generators = this.generators.map((g) => g.id === tmp.id ? {
+					...saved,
+					generatedUntil: tmp.generatedUntil
+				} : g);
+			}, "Habitude enregistrée : le créneau apparaît chaque semaine dans l’agenda.");
+			return;
+		}
+		const before = this.generators.find((g) => g.id === id);
+		await this.optimistic(() => {
+			this.generators = this.generators.map((g) => g.id === id ? local(g) : g);
+			const restoreRows = this.dropFutureRows(id);
+			return () => {
+				restoreRows();
+				if (before) this.generators = this.generators.map((g) => g.id === id ? before : g);
+			};
+		}, async () => {
+			const saved = await fetcher.updateGenerator(id, body);
+			this.generators = this.generators.map((g) => g.id === id ? {
+				...saved,
+				generatedUntil: (/* @__PURE__ */ new Date()).toISOString()
+			} : g);
+		}, "Habitude modifiée.");
+	}
+	async deleteGenerator(g) {
+		if (!confirm(`Supprimer l’habitude « ${describe(g)} » ? Les créneaux à venir qu’elle a créés seront supprimés.`)) return;
+		const id = g.id;
+		this.closePanel();
+		const before = this.generators;
+		await this.optimistic(() => {
+			this.generators = this.generators.filter((x) => x.id !== id);
+			const restoreRows = this.dropFutureRows(id);
+			return () => {
+				restoreRows();
+				this.generators = before;
+			};
+		}, async () => {
+			await fetcher.deleteGenerator(id);
+		}, "Habitude supprimée.");
+	}
+	/** Changes the cancellations of a generator on screen; returns how to undo it. */
+	setCancellations(id, change) {
+		const before = this.generators.find((g) => g.id === id);
+		this.generators = this.generators.map((g) => g.id === id ? {
+			...g,
+			cancellations: change(g.cancellations)
+		} : g);
+		return () => {
+			if (before) this.generators = this.generators.map((g) => g.id === id ? before : g);
+		};
+	}
+	/** "Cancelator": this occurrence of the repetition will not happen (removed if it was already created). */
+	async cancelOccurrence(generatorId, date) {
+		this.closePanel();
+		await this.optimistic(() => {
+			const undo = this.setCancellations(generatorId, (d) => [.../* @__PURE__ */ new Set([...d, date])]);
+			const keep = (r) => !(r.generatorId === generatorId && r.generatorOccurrence === date);
+			const before = {
+				dispos: this.dispos,
+				suggestions: this.suggestions
+			};
+			this.dispos = this.dispos.filter(keep);
+			this.suggestions = this.suggestions.filter(keep);
+			return () => {
+				undo();
+				this.dispos = before.dispos;
+				this.suggestions = before.suggestions;
+			};
+		}, async () => {
+			await fetcher.cancelOccurrence(generatorId, date);
+		}, "Occurrence annulée.");
+	}
+	async restoreOccurrence(generatorId, date) {
+		await this.optimistic(() => this.setCancellations(generatorId, (d) => d.filter((x) => x !== date)), async () => {
+			await fetcher.restoreOccurrence(generatorId, date);
+		}, "Occurrence rétablie.");
 	}
 	/** Default intercourse of a consumer (minutes). */
 	intercourseOf(assignationId) {
@@ -5941,8 +6712,8 @@ var raw = new class DomHandler {
 			to: Date.parse(to),
 			now: Date.now(),
 			maxMinutes,
-			dispos: this.dispos.filter((d) => this.isVisible(d.assignationId)),
-			suggestions: this.suggestions,
+			dispos: [...this.dispos, ...this.virtualDispos].filter((d) => this.isVisible(d.assignationId)),
+			suggestions: [...this.suggestions, ...this.virtualSuggestions],
 			contracts: this.contracts,
 			assignations: this.assignations,
 			remaining,
@@ -5972,13 +6743,42 @@ var raw = new class DomHandler {
 		});
 		this.proposals = this.proposals.filter((x) => x.id !== p.id);
 	}
+	/** The proposal becomes a meeting on screen at once; it comes back if the server refuses it. */
 	async validateProposal() {
 		const p = this.panel.ev.raw;
-		await this.run(async () => {
-			await this.bookProposal(p);
-			this.closePanel();
-			await this.refreshAgenda();
+		this.closePanel();
+		const tmp = this.tempMeeting(p.assignationId, p.start, Math.round((p.end.getTime() - p.start.getTime()) / 6e4));
+		await this.optimistic(() => {
+			this.proposals = this.proposals.filter((x) => x.id !== p.id);
+			this.meetings = [...this.meetings, tmp];
+			return () => {
+				this.meetings = this.meetings.filter((m) => m.id !== tmp.id);
+				this.proposals = [...this.proposals, p];
+			};
+		}, async () => {
+			const r = await fetcher.createMeeting({
+				assignationId: p.assignationId,
+				startAt: p.start.toISOString(),
+				durationMinutes: tmp.durationMinutes,
+				roomName: null,
+				comment: "",
+				idempotencyKey: `${p.id}-${uid()}`
+			});
+			this.meetings = this.meetings.map((m) => m.id === tmp.id ? r.meeting : m);
 		}, "Rendez-vous créé.");
+	}
+	/** Meeting drawn before the server created it. */
+	tempMeeting(assignationId, start, durationMinutes, roomName = null, comment = "") {
+		return {
+			id: tempId(),
+			assignationId,
+			startAt: start.toISOString(),
+			durationMinutes,
+			status: "pending",
+			roomName,
+			comment,
+			_pending: true
+		};
 	}
 	eraseProposal() {
 		const p = this.panel.ev.raw;
@@ -6026,16 +6826,37 @@ var raw = new class DomHandler {
 			this.error = "Impossible de déplacer un créneau dans le passé.";
 			return;
 		}
-		await this.run(async () => {
-			const body = {
-				startAt: start.toISOString(),
-				durationMinutes: data.duration,
-				love: data.love ?? .5
+		const body = {
+			startAt: start.toISOString(),
+			durationMinutes: data.duration,
+			love: data.love ?? .5
+		};
+		await this.saveRow(data.kind === "dispo" ? "dispos" : "suggestions", data.id, body, "Créneau déplacé.");
+	}
+	/**
+	* Moves / changes one of my intervals on screen at once, then on the server. A generated occurrence changed by
+	* hand leaves its repetition (the server cancels it there), the screen does the same.
+	*/
+	async saveRow(list, id, body, ok) {
+		const before = this[list].find((x) => x.id === id);
+		if (!before) return;
+		await this.optimistic(() => {
+			const undoCancel = before.generatorId ? this.setCancellations(before.generatorId, (d) => [.../* @__PURE__ */ new Set([...d, before.generatorOccurrence])]) : null;
+			this[list] = this[list].map((x) => x.id === id ? {
+				...x,
+				...body,
+				generatorId: null,
+				generatorOccurrence: null,
+				_pending: true
+			} : x);
+			return () => {
+				undoCancel?.();
+				this[list] = this[list].map((x) => x.id === id ? before : x);
 			};
-			if (data.kind === "dispo") await fetcher.updateDispo(data.id, body);
-			else await fetcher.updateSuggestion(data.id, body);
-			await this.refreshAgenda();
-		}, "Créneau déplacé.");
+		}, async () => {
+			const saved = list === "dispos" ? await fetcher.updateDispo(id, body) : await fetcher.updateSuggestion(id, body);
+			this[list] = this[list].map((x) => x.id === id ? saved : x);
+		}, ok);
 	}
 	dragCalendarEvent(e, ev) {
 		if (!ev.editable || ev.kind !== "dispo" && ev.kind !== "suggestion") {
@@ -6053,6 +6874,10 @@ var raw = new class DomHandler {
 	async selectAgent(value) {
 		this.selAssign = Number(value);
 		this.closePanel();
+		if (this.page === "consumer-habits") {
+			this.habitCal.events = this.buildHabitEvents();
+			return;
+		}
 		await this.refreshAgenda();
 	}
 	async createRequest() {
@@ -6085,6 +6910,7 @@ var raw = new class DomHandler {
 	closePanel() {
 		this.panel = null;
 		this.cal.selection = null;
+		this.habitCal.selection = null;
 	}
 	/** Fallback for keyboard and touch users who do not want to pick a slot in the grid. */
 	openCreate() {
@@ -6123,12 +6949,18 @@ var raw = new class DomHandler {
 				start: toLocalInput(start),
 				duration: Math.round((end.getTime() - start.getTime()) / 6e4),
 				love: .5,
-				contractId: this.contracts[0]?.id
+				contractId: this.contracts[0]?.id,
+				repeat: false,
+				intervalWeeks: 1
 			}
 		};
 	}
 	openEvent(ev) {
 		this.error = "";
+		if (ev.pending) {
+			this.error = "Enregistrement en cours… réessayez dans un instant.";
+			return;
+		}
 		if (ev.kind === "meeting") return this.openMeeting(ev.raw);
 		if (ev.kind === "slot") {
 			this.panel = {
@@ -6147,6 +6979,15 @@ var raw = new class DomHandler {
 			return;
 		}
 		if (ev.kind === "dispo" && this.role === "agent") return void this.openBook(ev);
+		if (ev.virtual) {
+			this.panel = {
+				type: "occurrence",
+				ev,
+				gen: this.generatorOf(ev.raw.generatorId),
+				error: ""
+			};
+			return;
+		}
 		this.panel = {
 			type: "interval",
 			error: "",
@@ -6155,7 +6996,9 @@ var raw = new class DomHandler {
 				start: toLocalInput(new Date(ev.raw.startAt)),
 				duration: ev.raw.durationMinutes,
 				love: ev.raw.love ?? .5,
-				contractId: ev.raw.contractId
+				contractId: ev.raw.contractId,
+				generatorId: ev.raw.generatorId ?? null,
+				occurrence: ev.raw.generatorOccurrence ?? null
 			}
 		};
 	}
@@ -6164,44 +7007,93 @@ var raw = new class DomHandler {
 		const ev = this.panel.ev;
 		this.beginInterval(ev.start, ev.end);
 	}
+	/** Saves the slot of the panel: shown at once, sent in the background. "Répéter" creates a weekly repetition instead. */
 	async submitInterval() {
-		await this.run(async () => {
-			const f = this.panel.form;
-			const start = new Date(f.start);
-			const duration = Number(f.duration);
-			const love = Number(f.love);
+		const f = this.panel.form;
+		const start = new Date(f.start);
+		const duration = Number(f.duration);
+		const love = Number(f.love);
+		if (!this.check(() => {
 			if (Number.isNaN(start.getTime())) throw new Error("La date de début est invalide.");
 			if (!Number.isInteger(duration) || duration <= 0) throw new Error("La durée doit être un nombre entier de minutes.");
 			if (!(love >= 0 && love <= 1)) throw new Error("La préférence doit être comprise entre 0 et 1.");
 			if (start.getTime() + duration * 6e4 <= Date.now()) throw new Error("Ce créneau est déjà passé.");
-			const body = {
-				startAt: start.toISOString(),
-				durationMinutes: duration,
-				love
+			if (f.repeat && duration > 1440) throw new Error("Un créneau répété dure 24 h au plus.");
+		})) return;
+		const body = {
+			startAt: start.toISOString(),
+			durationMinutes: duration,
+			love
+		};
+		const list = this.role === "consumer" ? "dispos" : "suggestions";
+		if (!f.id && f.repeat) {
+			const tz = browserTimeZone();
+			const form = {
+				...newGenForm(),
+				weekday: start.getDay(),
+				start: hhmm(start.getHours() * 60 + start.getMinutes()),
+				duration,
+				love,
+				intervalWeeks: Number(f.intervalWeeks) || 1,
+				startsOn: localDate(start.getTime(), tz),
+				contractId: Number(f.contractId) || null
 			};
-			if (this.role === "consumer") if (f.id) await fetcher.updateDispo(f.id, body);
-			else await fetcher.createDispo({
-				assignationId: this.selAssign,
-				requestId: this.currentRequest()?.id,
-				...body
+			let ok = false;
+			this.check(() => {
+				this.generatorBody(form);
+				ok = true;
 			});
-			else if (f.id) await fetcher.updateSuggestion(f.id, body);
-			else await fetcher.createSuggestion({
-				contractId: Number(f.contractId),
-				...body
-			});
+			if (!ok) return;
 			this.closePanel();
-			await this.refreshAgenda();
+			return this.saveGenerator(form);
+		}
+		this.closePanel();
+		if (f.id) return this.saveRow(list, f.id, body, "Créneau enregistré.");
+		const tmp = this.role === "consumer" ? {
+			id: tempId(),
+			assignationId: this.selAssign,
+			requestId: this.currentRequest()?.id,
+			...body,
+			_pending: true
+		} : {
+			id: tempId(),
+			contractId: Number(f.contractId),
+			...body,
+			_pending: true
+		};
+		await this.optimistic(() => {
+			this[list] = [...this[list], tmp];
+			return () => {
+				this[list] = this[list].filter((x) => x.id !== tmp.id);
+			};
+		}, async () => {
+			const saved = this.role === "consumer" ? await fetcher.createDispo({
+				assignationId: tmp.assignationId,
+				requestId: tmp.requestId,
+				...body
+			}) : await fetcher.createSuggestion({
+				contractId: tmp.contractId,
+				...body
+			});
+			this[list] = this[list].map((x) => x.id === tmp.id ? saved : x);
 		}, "Créneau enregistré.");
 	}
 	async deleteInterval() {
-		if (!confirm("Supprimer ce créneau ?")) return;
-		await this.run(async () => {
-			const id = this.panel.form.id;
-			if (this.role === "consumer") await fetcher.deleteDispo(id);
+		const f = this.panel.form;
+		if (!confirm(f.generatorId ? "Supprimer cette occurrence ? La répétition continue les autres semaines." : "Supprimer ce créneau ?")) return;
+		const id = f.id, list = this.role === "consumer" ? "dispos" : "suggestions";
+		const row = this[list].find((x) => x.id === id);
+		this.closePanel();
+		await this.optimistic(() => {
+			const undoCancel = row?.generatorId ? this.setCancellations(row.generatorId, (d) => [.../* @__PURE__ */ new Set([...d, row.generatorOccurrence])]) : null;
+			this[list] = this[list].filter((x) => x.id !== id);
+			return () => {
+				undoCancel?.();
+				if (row) this[list] = [...this[list], row];
+			};
+		}, async () => {
+			if (list === "dispos") await fetcher.deleteDispo(id);
 			else await fetcher.deleteSuggestion(id);
-			this.closePanel();
-			await this.refreshAgenda();
 		}, "Créneau supprimé.");
 	}
 	/**
@@ -6241,16 +7133,18 @@ var raw = new class DomHandler {
 		}
 		if (p.form.roomName && p.rooms.some((r) => r.name === p.form.roomName && r.available === false)) p.form.roomName = "";
 	}
+	/** The meeting is drawn at once (checked here like the server does), and removed again if the server refuses it. */
 	async submitBook() {
-		await this.run(async () => {
-			const p = this.panel;
-			const f = p.form;
-			const start = new Date(f.start);
-			const duration = Number(f.duration);
+		const p = this.panel;
+		const f = p.form;
+		const start = new Date(f.start);
+		const duration = Number(f.duration);
+		if (!this.check(() => {
 			if (Number.isNaN(start.getTime()) || !Number.isInteger(duration) || duration <= 0) throw new Error("Date ou durée invalide.");
+			if (start.getTime() <= Date.now()) throw new Error("Un rendez-vous doit commencer dans le futur.");
 			const ev = p.ev;
 			const end = start.getTime() + duration * 6e4;
-			const related = this.dispos.filter((d) => d.assignationId === f.assignationId && d.requestId === ev.raw.requestId).map((d) => ({
+			const related = [...this.dispos, ...this.virtualDispos].filter((d) => d.assignationId === f.assignationId && d.requestId === ev.raw.requestId).map((d) => ({
 				start: Date.parse(d.startAt),
 				end: Date.parse(d.startAt) + d.durationMinutes * 6e4
 			})).sort((a, b) => a.start - b.start);
@@ -6265,7 +7159,18 @@ var raw = new class DomHandler {
 				const windowEnd = related.find((interval) => interval.start <= start.getTime() && interval.end >= start.getTime())?.end ?? ev.end.getTime();
 				throw new Error(`Le rendez-vous doit rester dans une disponibilité continue à partir de ${this.cal.time(new Date(start.getTime()))} (disponible jusqu’à ${this.cal.time(new Date(windowEnd))}).`);
 			}
-			await fetcher.createMeeting({
+			const s = start.getTime();
+			if (this.meetings.some((m) => m.status !== "canceledBy" && Date.parse(m.startAt) < end && Date.parse(m.startAt) + m.durationMinutes * 6e4 > s)) throw new Error("Vous avez déjà un rendez-vous sur ce créneau.");
+		})) return;
+		this.closePanel();
+		const tmp = this.tempMeeting(f.assignationId, start, duration, f.roomName || null, f.comment ?? "");
+		await this.optimistic(() => {
+			this.meetings = [...this.meetings, tmp];
+			return () => {
+				this.meetings = this.meetings.filter((m) => m.id !== tmp.id);
+			};
+		}, async () => {
+			const r = await fetcher.createMeeting({
 				assignationId: f.assignationId,
 				startAt: start.toISOString(),
 				durationMinutes: duration,
@@ -6273,8 +7178,7 @@ var raw = new class DomHandler {
 				comment: f.comment ?? "",
 				idempotencyKey: p.key
 			});
-			this.closePanel();
-			await this.refreshAgenda();
+			this.meetings = this.meetings.map((m) => m.id === tmp.id ? r.meeting : m);
 		}, "Rendez-vous créé.");
 	}
 	openMeeting(m) {
@@ -6284,40 +7188,76 @@ var raw = new class DomHandler {
 			error: "",
 			form: {
 				comment: m.comment ?? "",
-				roomName: m.roomName ?? m.room ?? ""
+				roomName: m.roomName ?? m.room ?? "",
+				actual: m.durationMinutes
 			}
 		};
 	}
+	/** "60 min" or, for a meeting validated with another duration, "60 min prévues · 45 min effectuées". */
+	durationLabel(m) {
+		const a = m.actualDurationMinutes;
+		return a != null && a !== m.durationMinutes ? `${m.durationMinutes} min prévues · ${a} min effectuées` : `${a ?? m.durationMinutes} min`;
+	}
 	canEditMeeting(m) {
-		return this.role === "agent" && m.status === "pending";
+		return this.role === "agent" && m.status === "pending" && m.id > 0;
 	}
 	canCancelMeeting(m) {
-		return m.status === "pending";
+		return m.status === "pending" && m.id > 0;
+	}
+	/** Changes one meeting of the agenda on screen; returns how to undo it. */
+	patchMeetingLocal(id, change) {
+		const before = this.meetings.find((m) => m.id === id);
+		this.meetings = this.meetings.map((m) => m.id === id ? {
+			...m,
+			...change
+		} : m);
+		return () => {
+			if (before) this.meetings = this.meetings.map((m) => m.id === id ? before : m);
+		};
 	}
 	async saveMeeting() {
-		await this.run(async () => {
-			const p = this.panel;
-			await fetcher.patchMeeting(p.m.id, {
-				comment: p.form.comment,
-				roomName: p.form.roomName || null
-			});
-			this.closePanel();
-			await this.refreshAgenda();
+		const p = this.panel;
+		const id = p.m.id, change = {
+			comment: p.form.comment,
+			roomName: p.form.roomName || null
+		};
+		this.closePanel();
+		await this.optimistic(() => this.patchMeetingLocal(id, change), async () => {
+			await fetcher.patchMeeting(id, change);
 		}, "Rendez-vous mis à jour.");
 	}
+	/** Validates the meeting with the duration really spent (the booked one by default). */
 	async markDone() {
-		await this.run(async () => {
-			await fetcher.patchMeeting(this.panel.m.id, { status: "done" });
-			this.closePanel();
-			await this.refreshAgenda();
+		const p = this.panel;
+		const minutes = Number(p.form.actual);
+		if (!this.check(() => {
+			if (!Number.isInteger(minutes) || minutes <= 0) throw new Error("La durée réelle est un nombre entier de minutes, supérieur à 0.");
+		})) return;
+		const id = p.m.id, actual = minutes === p.m.durationMinutes ? null : minutes;
+		const change = {
+			comment: p.form.comment,
+			roomName: p.form.roomName || null
+		};
+		const changed = change.comment !== (p.m.comment ?? "") || change.roomName !== (p.m.roomName ?? null);
+		this.closePanel();
+		await this.optimistic(() => this.patchMeetingLocal(id, {
+			...change,
+			status: "done",
+			actualDurationMinutes: actual
+		}), async () => {
+			if (changed) await fetcher.patchMeeting(id, change);
+			await fetcher.patchMeeting(id, {
+				status: "done",
+				actualDurationMinutes: actual
+			});
 		}, "Rendez-vous marqué comme terminé.");
 	}
 	async cancelMeeting() {
 		if (!confirm("Annuler ce rendez-vous ?")) return;
-		await this.run(async () => {
-			await fetcher.cancelMeeting(this.panel.m.id);
-			this.closePanel();
-			await this.refreshAgenda();
+		const id = this.panel.m.id;
+		this.closePanel();
+		await this.optimistic(() => this.patchMeetingLocal(id, { status: "canceledBy" }), async () => {
+			await fetcher.cancelMeeting(id);
 		}, "Rendez-vous annulé.");
 	}
 }();

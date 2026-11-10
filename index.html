@@ -8,6 +8,9 @@
 	<link rel="icon" href="data:,">
 </head>
 <body x-data="app" x-cloak @keydown.escape.window="closePanel()">
+<!-- Activity: thin bar while something loads or is sent, and a note while changes already shown are being saved -->
+<div data-progress :hidden="!(busy || loading || syncing > 0)" hidden role="progressbar" aria-label="Chargement en cours"></div>
+<p data-syncing :hidden="!(syncing > 0)" hidden role="status" aria-live="polite"><span data-spinner aria-hidden="true"></span> Enregistrement…</p>
 
 <header>
 	<a href="#main" data-brand>Planning</a>
@@ -29,6 +32,7 @@
 				<li><a href="#agent-companies" :aria-current="page === 'agent-companies' ? 'page' : null">Sociétés</a></li>
 				<li><a href="#agent-consumers" :aria-current="page === 'agent-consumers' ? 'page' : null">Consommateurs</a></li>
 				<li><a href="#agent-agenda" :aria-current="page === 'agent-agenda' ? 'page' : null">Agenda</a></li>
+				<li><a href="#agent-habits" :aria-current="page === 'agent-habits' ? 'page' : null">Habitudes</a></li>
 				<li><a href="#agent-results" :aria-current="page === 'agent-results' ? 'page' : null">Résultats</a></li>
 				<li><a href="#agent-script" :aria-current="page === 'agent-script' ? 'page' : null">Script</a></li>
 			</ul>
@@ -37,6 +41,7 @@
 			<ul>
 				<li><a href="#consumer-dashboard" :aria-current="page === 'consumer-dashboard' ? 'page' : null">Tableau de bord</a></li>
 				<li><a href="#consumer-agenda" :aria-current="page === 'consumer-agenda' ? 'page' : null">Agenda</a></li>
+				<li><a href="#consumer-habits" :aria-current="page === 'consumer-habits' ? 'page' : null">Habitudes</a></li>
 			</ul>
 		</template>
 	</nav>
@@ -48,7 +53,8 @@
 <main>
 	<template x-if="error"><p role="alert" data-tone="error" x-text="error"></p></template>
 	<template x-if="notice"><p role="status" data-tone="ok" x-text="notice"></p></template>
-	<template x-if="!ready"><p>Chargement…</p></template>
+	<template x-if="!ready"><p data-loading role="status"><span data-spinner aria-hidden="true"></span> Chargement…</p></template>
+	<template x-if="ready && loading && !page.endsWith('-agenda')"><p data-loading role="status"><span data-spinner aria-hidden="true"></span> Chargement…</p></template>
 
 	<!-- ============ Home ============ -->
 	<template x-if="page === 'main'">
@@ -523,7 +529,7 @@
 										<td x-text="fmt(r.start)"></td>
 										<td><span data-state :data-value="r.state" x-text="res.stateLabel(r.state)"></span></td>
 										<td x-text="money(r.rate) + ' / h'"></td>
-										<td x-text="r.minutes + ' min'"></td>
+										<td><span x-text="r.minutes + ' min'"></span><template x-if="r.minutes !== r.plannedMinutes"><small x-text="' (' + r.plannedMinutes + ' min prévues)'"></small></template></td>
 										<td x-text="hoursLabel(r.hours)"></td>
 										<template x-if="res.isAdmin"><td x-text="money(r.paid)"></td></template>
 										<template x-if="res.isAdmin"><td x-text="money(r.society)"></td></template>
@@ -533,11 +539,19 @@
 											<template x-if="r.status !== 'pending'"><span x-text="r.comment || '—'"></span></template>
 										</td>
 										<td>
-											<template x-if="r.status === 'pending'">
+											<template x-if="r.status === 'pending' && doneEdit?.id !== r.id">
 												<span data-row-actions>
 													<button type="button" data-variant="confirm" @click="resultDone(r.id)" :disabled="busy">Terminer</button>
 													<button type="button" data-variant="danger" @click="resultCancel(r.id)" :disabled="busy">Annuler</button>
 												</span>
+											</template>
+											<!-- Validation: the agent (or admin) gives the time really spent -->
+											<template x-if="r.status === 'pending' && doneEdit?.id === r.id">
+												<form data-row-actions @submit.prevent="resultConfirmDone()">
+													<label>Durée réelle (min) <input type="number" min="1" step="1" x-model.number="doneEdit.minutes" x-init="$nextTick(() => $el.focus())" required></label>
+													<button type="submit" data-variant="confirm">Valider</button>
+													<button type="button" @click="doneEdit = null">Annuler</button>
+												</form>
 											</template>
 										</td>
 									</tr>
@@ -619,7 +633,8 @@
 						<tbody>
 							<template x-for="x in assignations" :key="x.id">
 								<tr>
-									<td x-text="consumerLabel(x)"></td>
+									<!-- A click on the name copies the consumer's access link (to send it to him) -->
+									<td><button type="button" data-name-copy @click="copyConsumerLink(x)" :title="'Copier le lien d’accès de ' + consumerLabel(x)" :aria-label="consumerLabel(x) + ' : copier son lien d’accès'"><span x-text="consumerLabel(x)"></span> <small aria-hidden="true">⧉</small></button></td>
 									<td x-text="consumerOf(x).username"></td>
 									<td x-text="x.companyName"></td>
 									<td>
@@ -828,7 +843,7 @@
 							<template x-for="m in upcoming()" :key="m.id">
 								<tr>
 									<td x-text="fmt(m.startAt)"></td>
-									<td x-text="m.durationMinutes + ' min'"></td>
+									<td x-text="durationLabel(m)"></td>
 									<template x-if="role === 'admin'"><td x-text="meetingAgent(m)"></td></template>
 									<template x-if="role === 'admin'"><td x-text="meetingConsumer(m)"></td></template>
 									<td>
@@ -848,6 +863,137 @@
 						</tbody>
 					</table>
 				</div>
+			</template>
+		</section>
+	</template>
+
+	<!-- ============ Habitudes: the week template of the weekly repetitions (agent and consumer) ============ -->
+	<template x-if="page === 'agent-habits' || page === 'consumer-habits'">
+		<section data-cal data-habits x-place="{'--days': habitCal.days.length, '--hours': habitCal.hours.length}" x-init="$nextTick(() => habitCal.scrollToNow($refs.habitScroller))">
+			<h1>Habitudes</h1>
+			<p data-intro x-text="role === 'agent'
+				? 'Votre semaine type : ces horaires se répètent chaque semaine dans l’agenda. Les deux prochaines semaines sont créées automatiquement, les suivantes au fur et à mesure. Dessinez un créneau pour ajouter une habitude, touchez-en une pour la modifier.'
+				: 'Votre semaine type : ces disponibilités se répètent chaque semaine dans l’agenda de l’agent choisi. Les deux prochaines semaines sont créées automatiquement, les suivantes au fur et à mesure. Dessinez un créneau pour ajouter une habitude, touchez-en une pour la modifier.'"></p>
+
+			<template x-if="page === 'consumer-habits'">
+				<div data-request>
+					<template x-if="!agentsList.length && !loading"><p>Aucun agent ne vous est encore assigné.</p></template>
+					<template x-if="agentsList.length">
+						<label>Agent
+							<select @change="selectAgent($event.target.value)">
+								<template x-for="a in agentsList" :key="assignId(a)">
+									<option :value="assignId(a)" :selected="assignId(a) === selAssign" x-text="agentLabel(a)"></option>
+								</template>
+							</select>
+						</label>
+					</template>
+				</div>
+			</template>
+
+			<div role="toolbar" aria-label="Semaine type" data-toolbar>
+				<p data-range aria-live="polite"><span x-text="habitCal.title"></span><template x-if="loading"><span data-spinner role="img" aria-label="Chargement des habitudes"></span></template></p>
+				<button type="button" data-variant="add" @click="openNewHabit()">Ajouter une habitude</button>
+			</div>
+
+			<ul data-legend aria-label="Légende">
+				<template x-if="role === 'agent'"><li><i data-kind="suggestion"></i> Mes horaires</li></template>
+				<template x-if="role === 'agent'"><li><i data-kind="dispo"></i> Disponibilités habituelles des consommateurs</li></template>
+				<template x-if="role === 'consumer'"><li><i data-kind="dispo"></i> Mes disponibilités</li></template>
+				<template x-if="role === 'consumer'"><li><i data-kind="slot"></i> Horaires habituels de l’agent</li></template>
+			</ul>
+
+			<div data-scroll x-ref="habitScroller" @touchstart.passive="habitCal.swipeStart($event)" @touchend="habitCal.swipeEnd($event)" :aria-busy="loading">
+				<div data-head>
+					<!-- On a phone one day is shown: the arrows go through the days of the week -->
+					<template x-if="habitCal.isMobile"><button type="button" data-nav="prev" @click="habitCal.prev()" aria-label="Jour précédent">‹</button></template>
+					<template x-if="!habitCal.isMobile"><span aria-hidden="true"></span></template>
+					<template x-for="d in habitCal.days" :key="habitCal.key(d)">
+						<div data-day-head :data-today="habitCal.isToday(d)"><b x-text="habitCal.longDay(d)"></b></div>
+					</template>
+					<template x-if="habitCal.isMobile"><button type="button" data-nav="next" @click="habitCal.next()" aria-label="Jour suivant">›</button></template>
+				</div>
+				<div data-grid>
+					<ol data-hours aria-hidden="true">
+						<template x-for="h in habitCal.hours" :key="h"><li x-text="h + ' h'"></li></template>
+					</ol>
+					<template x-for="d in habitCal.days" :key="habitCal.key(d)">
+						<div data-day role="group" :aria-label="habitCal.longDay(d)" :data-today="habitCal.isToday(d)"
+							@pointerdown="habitCal.down($event, d)" @pointermove="habitCal.move($event)" @pointerup="habitCal.up($event)" @pointercancel="habitCal.cancel()"
+							@touchmove="habitCal.touchMove($event)" @contextmenu.prevent>
+							<template x-for="p in habitCal.layoutFor(d)" :key="p.ev.id">
+								<button type="button" data-event :data-event-id="p.ev.id" :data-kind="p.ev.kind" :data-readonly="!p.ev.editable || null" :data-pending="p.ev.pending || null" :aria-busy="p.ev.pending ? 'true' : null" x-place="habitCal.place(p)" @click="if (!habitCal.shouldSuppressEventClick()) openHabitEvent(p.ev)"
+									:aria-label="(p.ev.editable ? 'Mon habitude' : 'Habitude') + (p.ev.pending ? ' (enregistrement en cours)' : '') + ', ' + p.ev.title + ', ' + habitCal.longDay(p.ev.start) + ' de ' + habitCal.time(p.ev.start) + ' à ' + habitCal.time(p.ev.end)">
+									<b x-text="p.ev.title"></b>
+									<template x-if="p.ev.love != null"><small data-love title="Préférence" x-text="Math.round(p.ev.love * 100) + ' %'"></small></template>
+									<time x-text="habitCal.time(p.ev.start) + ' – ' + habitCal.time(p.ev.end)"></time>
+								</button>
+							</template>
+							<template x-if="habitCal.selectionFor(d)">
+								<div data-select x-place="habitCal.selectionFor(d)"><span x-text="habitCal.selectionLabel()"></span></div>
+							</template>
+							<template x-if="habitCal.nowMin(d) !== null">
+								<div data-now x-place="{'--start': habitCal.nowMin(d)}"></div>
+							</template>
+						</div>
+					</template>
+				</div>
+			</div>
+
+			<!-- Habit panel (side panel on desktop, bottom sheet on mobile) -->
+			<template x-if="panel">
+				<aside role="dialog" aria-modal="true" aria-label="Habitude">
+					<button type="button" data-variant="close" @click="closePanel()" aria-label="Fermer">×</button>
+					<template x-if="panel.error"><p role="alert" data-tone="error" x-text="panel.error"></p></template>
+
+					<template x-if="panel.type === 'habit'">
+						<form @submit.prevent="submitHabit()">
+							<h2 x-text="panel.form.id ? 'Modifier l’habitude' : (role === 'agent' ? 'Nouvelle habitude (mes horaires)' : 'Nouvelle habitude (ma disponibilité)')"></h2>
+							<template x-if="role === 'agent' && contracts.length > 1">
+								<label>Société
+									<select x-model.number="panel.form.contractId" :disabled="!!panel.form.id">
+										<template x-for="c in contracts" :key="c.id"><option :value="c.id" x-text="contractLabel(c)"></option></template>
+									</select>
+								</label>
+							</template>
+							<label>Jour
+								<select x-model.number="panel.form.weekday">
+									<template x-for="d in weekdays()" :key="d.value"><option :value="d.value" :selected="d.value === panel.form.weekday" x-text="d.label"></option></template>
+								</select>
+							</label>
+							<label>Début <input type="time" step="900" x-model="panel.form.start" required></label>
+							<label>Durée (minutes) <input type="number" min="15" max="1440" step="15" x-model.number="panel.form.duration" required></label>
+							<label>Toutes les (semaines) <input type="number" min="1" max="52" x-model.number="panel.form.intervalWeeks" required>
+								<small>1 : chaque semaine · 2 : une semaine sur deux…</small>
+							</label>
+							<label>À partir du <input type="date" x-model="panel.form.startsOn" required></label>
+							<label>Jusqu’au (facultatif) <input type="date" x-model="panel.form.endsOn" :min="panel.form.startsOn"></label>
+							<label>Préférence : <output x-text="Math.round(panel.form.love * 100) + ' %'"></output>
+								<input type="range" min="0" max="1" step="0.1" x-model.number="panel.form.love">
+								<small>0 % : possible en dernier recours · 100 % : idéal</small>
+							</label>
+							<template x-if="panel.gen && futureCancellations(panel.gen).length">
+								<p data-cancellations>Semaines annulées :
+									<template x-for="d in futureCancellations(panel.gen)" :key="d">
+										<button type="button" data-chip @click="restoreOccurrence(panel.gen.id, d); panel.gen = generatorOf(panel.gen.id)" :title="'Rétablir le ' + occurrenceLabel(d)"><span x-text="occurrenceLabel(d)"></span> ↺</button>
+									</template>
+								</p>
+							</template>
+							<p data-actions>
+								<button type="submit" x-text="panel.form.id ? 'Enregistrer' : 'Ajouter l’habitude'"></button>
+								<template x-if="panel.gen"><button type="button" data-variant="danger" @click="deleteGenerator(panel.gen)">Supprimer</button></template>
+							</p>
+						</form>
+					</template>
+
+					<template x-if="panel.type === 'habit-info'">
+						<div>
+							<h2 x-text="role === 'agent' ? 'Habitude du consommateur' : 'Habitude de l’agent'"></h2>
+							<p><b x-text="panel.ev.title"></b></p>
+							<p x-text="describeGenerator(panel.ev.raw)"></p>
+							<p><small x-text="generatorPeriod(panel.ev.raw)"></small></p>
+						</div>
+					</template>
+				</aside>
 			</template>
 		</section>
 	</template>
@@ -911,7 +1057,7 @@
 
 			<div role="toolbar" aria-label="Navigation de l’agenda" data-toolbar>
 				<button type="button" @click="cal.today()">Aujourd’hui</button>
-				<p data-range aria-live="polite" x-text="cal.title"></p>
+				<p data-range aria-live="polite"><span x-text="cal.title"></span><template x-if="loading"><span data-spinner role="img" aria-label="Chargement de la période"></span></template></p>
 				<div role="group" aria-label="Affichage">
 					<button type="button" @click="cal.setView('day')" :aria-pressed="cal.settings.mode === 'days' && cal.count === 1">Jour</button>
 					<button type="button" @click="cal.setView('week')" :aria-pressed="cal.settings.mode === 'week'">Semaine</button>
@@ -954,6 +1100,7 @@
 				<li><i data-kind="dispo"></i> Disponibilité</li>
 				<li><i data-kind="meeting" data-status="pending"></i> Rendez-vous en attente</li>
 				<li><i data-kind="meeting" data-status="done"></i> Rendez-vous terminé</li>
+				<li><i data-kind="dispo" data-virtual></i> Habitude (créée au fur et à mesure)</li>
 				<template x-if="page === 'agent-agenda'"><li><i data-kind="proposal"></i> Proposition (non enregistrée)</li></template>
 				<template x-if="page === 'agent-agenda'"><li><i data-gap></i> Intercours</li></template>
 			</ul>
@@ -982,9 +1129,9 @@
 								<div data-gap :data-status="g.ev.status" x-place="cal.place(g)" :title="g.ev.title + (g.ev.status === 'short' ? ' (non respecté)' : '')" aria-hidden="true"><small x-text="g.ev.title"></small></div>
 							</template>
 							<template x-for="p in cal.layoutFor(d)" :key="p.ev.id">
-								<button type="button" data-event :data-event-id="p.ev.id" :data-kind="p.ev.kind" :data-status="p.ev.status" x-place="cal.place(p)" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
-									:aria-label="kindLabel(p.ev.kind) + ', ' + p.ev.title + (p.ev.love != null ? ', préférence ' + Math.round(p.ev.love * 100) + ' %' : '') + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
-									<b x-text="p.ev.title"></b>
+								<button type="button" data-event :data-event-id="p.ev.id" :data-kind="p.ev.kind" :data-status="p.ev.status" :data-virtual="p.ev.virtual || null" :data-pending="p.ev.pending || null" :aria-busy="p.ev.pending ? 'true' : null" x-place="cal.place(p)" @click="if (!cal.shouldSuppressEventClick()) openEvent(p.ev)"
+									:aria-label="kindLabel(p.ev.kind) + (p.ev.virtual ? ' (habitude)' : '') + (p.ev.pending ? ' (enregistrement en cours)' : '') + ', ' + p.ev.title + (p.ev.love != null ? ', préférence ' + Math.round(p.ev.love * 100) + ' %' : '') + ', de ' + cal.time(p.ev.start) + ' à ' + cal.time(p.ev.end)">
+									<b><template x-if="p.ev.virtual"><span aria-hidden="true" title="Habitude">↻ </span></template><span x-text="p.ev.title"></span></b>
 									<template x-if="p.ev.love != null"><small data-love title="Préférence" x-text="Math.round(p.ev.love * 100) + ' %'"></small></template>
 									<time x-text="cal.time(p.ev.start) + ' – ' + cal.time(p.ev.end)"></time>
 								</button>
@@ -1041,7 +1188,7 @@
 						<template x-for="m in cancelledMeetings()" :key="m.id">
 							<li>
 								<button type="button" @click="openMeeting(m)">
-									<span x-text="fmt(m.startAt) + ' · ' + m.durationMinutes + ' min'"></span>
+									<span x-text="fmt(m.startAt) + ' · ' + durationLabel(m)"></span>
 									<template x-if="role === 'agent'"><span x-text="' — ' + who(m.assignationId)"></span></template>
 								</button>
 							</li>
@@ -1072,17 +1219,43 @@
 								<input type="range" min="0" max="1" step="0.1" x-model="panel.form.love">
 								<small>0 % : possible en dernier recours · 100 % : idéal</small>
 							</label>
+							<template x-if="!panel.form.id">
+								<div data-repeat>
+									<label data-check><input type="checkbox" x-model="panel.form.repeat"> Répéter chaque semaine (habitude)</label>
+									<template x-if="panel.form.repeat">
+										<label>Toutes les (semaines) <input type="number" min="1" max="52" x-model.number="panel.form.intervalWeeks"></label>
+									</template>
+								</div>
+							</template>
+							<template x-if="panel.form.generatorId">
+								<p><small>↻ Fait partie de l’habitude « <span x-text="describeGenerator(generatorOf(panel.form.generatorId))"></span> ». Le modifier le détache de l’habitude pour cette semaine.</small></p>
+							</template>
 							<p data-actions>
-								<button type="submit" :disabled="busy">Enregistrer</button>
-								<template x-if="panel.form.id"><button type="button" data-variant="danger" @click="deleteInterval()" :disabled="busy">Supprimer</button></template>
+								<button type="submit" x-text="panel.form.repeat ? 'Créer l’habitude' : 'Enregistrer'"></button>
+								<template x-if="panel.form.id"><button type="button" data-variant="danger" @click="deleteInterval()" x-text="panel.form.generatorId ? 'Supprimer cette semaine' : 'Supprimer'"></button></template>
+								<template x-if="panel.form.generatorId && generatorOf(panel.form.generatorId)"><button type="button" @click="editGenerator(generatorOf(panel.form.generatorId))">Modifier l’habitude</button></template>
 							</p>
 						</form>
+					</template>
+
+					<template x-if="panel.type === 'occurrence'">
+						<div>
+							<h2>Habitude</h2>
+							<p><span x-text="cal.longDay(panel.ev.start)"></span>, de <b x-text="cal.time(panel.ev.start)"></b> à <b x-text="cal.time(panel.ev.end)"></b>.</p>
+							<p><small>↻ <span x-text="describeGenerator(panel.gen)"></span>. Ce créneau sera créé automatiquement deux semaines avant.</small></p>
+							<template x-if="panel.gen">
+								<p data-actions>
+									<button type="button" data-variant="danger" @click="cancelOccurrence(panel.gen.id, panel.ev.raw.generatorOccurrence)">Annuler cette semaine</button>
+									<button type="button" @click="editGenerator(panel.gen)">Modifier l’habitude</button>
+								</p>
+							</template>
+						</div>
 					</template>
 
 					<template x-if="panel.type === 'slot'">
 						<div>
 							<h2>Horaires de l’agent</h2>
-							<p x-text="fmt(panel.ev.raw.startAt) + ' · ' + panel.ev.raw.durationMinutes + ' min'"></p>
+							<p x-text="fmt(panel.ev.raw.startAt) + ' · ' + panel.ev.raw.durationMinutes + ' min' + (panel.ev.virtual ? ' (habitude de l’agent)' : '')"></p>
 							<p data-actions><button type="button" data-variant="add" @click="useSlot()">Proposer une disponibilité ici</button></p>
 						</div>
 					</template>
@@ -1091,7 +1264,7 @@
 						<form @submit.prevent="submitBook()">
 							<h2>Créer un rendez-vous</h2>
 							<p><b x-text="panel.ev.title"></b> est disponible de <b x-text="cal.time(panel.ev.start)"></b> à <b x-text="cal.time(panel.ev.end)"></b>
-								(préférence <span x-text="Math.round((panel.ev.love ?? 0) * 100) + ' %'"></span>).</p>
+								(préférence <span x-text="Math.round((panel.ev.love ?? 0) * 100) + ' %'"></span>)<template x-if="panel.ev.virtual"><span> — habitude répétée chaque semaine</span></template>.</p>
 							<label>Début <input type="datetime-local" x-model="panel.form.start" step="900" @change="checkRooms()" required></label>
 							<label>Durée (minutes) <input type="number" min="15" step="15" x-model="panel.form.duration" @change="checkRooms()" required></label>
 							<label>Salle
@@ -1103,7 +1276,7 @@
 								</select>
 							</label>
 							<label>Commentaire <textarea x-model="panel.form.comment" maxlength="2000" rows="3"></textarea></label>
-							<p data-actions><button type="submit" :disabled="busy">Créer le rendez-vous</button></p>
+							<p data-actions><button type="submit">Créer le rendez-vous</button></p>
 						</form>
 					</template>
 
@@ -1113,8 +1286,8 @@
 							<p><b x-text="panel.ev.title"></b>, <span x-text="cal.longDay(panel.ev.start)"></span> de <b x-text="cal.time(panel.ev.start)"></b> à <b x-text="cal.time(panel.ev.end)"></b>.</p>
 							<p><small>Cette proposition n’est pas encore enregistrée.</small></p>
 							<p data-actions>
-								<button type="button" data-variant="confirm" @click="validateProposal()" :disabled="busy">Valider</button>
-								<button type="button" data-variant="danger" @click="eraseProposal()" :disabled="busy">Effacer</button>
+								<button type="button" data-variant="confirm" @click="validateProposal()">Valider</button>
+								<button type="button" data-variant="danger" @click="eraseProposal()">Effacer</button>
 							</p>
 						</div>
 					</template>
@@ -1123,7 +1296,7 @@
 						<div>
 							<h2>Rendez-vous</h2>
 							<dl>
-								<dt>Date</dt><dd x-text="fmt(panel.m.startAt) + ' · ' + panel.m.durationMinutes + ' min'"></dd>
+								<dt>Date</dt><dd x-text="fmt(panel.m.startAt) + ' · ' + durationLabel(panel.m)"></dd>
 								<dt>Statut</dt><dd x-text="statusLabel(panel.m.status)"></dd>
 								<template x-if="role === 'agent'"><dt>Consommateur</dt></template>
 								<template x-if="role === 'agent'"><dd x-text="who(panel.m.assignationId)"></dd></template>
@@ -1140,13 +1313,19 @@
 									</label>
 									<label>Commentaire <textarea x-model="panel.form.comment" maxlength="2000" rows="3"></textarea></label>
 									<p data-actions>
-										<button type="submit" :disabled="busy">Enregistrer</button>
-										<button type="button" data-variant="confirm" @click="markDone()" :disabled="busy">Marquer comme terminé</button>
+										<button type="submit">Enregistrer</button>
 									</p>
+									<!-- Validation: the duration really spent can differ from the booked one (prices follow it) -->
+									<fieldset data-done>
+										<legend>Le rendez-vous a eu lieu</legend>
+										<label>Durée réellement effectuée (minutes) <input type="number" min="1" step="1" x-model.number="panel.form.actual" required></label>
+										<small x-show="Number(panel.form.actual) !== panel.m.durationMinutes" x-text="'Prévu : ' + panel.m.durationMinutes + ' min. Le prix sera calculé sur ' + panel.form.actual + ' min.'"></small>
+										<p data-actions><button type="button" data-variant="confirm" @click="markDone()">Marquer comme terminé</button></p>
+									</fieldset>
 								</form>
 							</template>
 							<template x-if="canCancelMeeting(panel.m)">
-								<p data-actions><button type="button" data-variant="danger" @click="cancelMeeting()" :disabled="busy">Annuler le rendez-vous</button></p>
+								<p data-actions><button type="button" data-variant="danger" @click="cancelMeeting()">Annuler le rendez-vous</button></p>
 							</template>
 						</div>
 					</template>

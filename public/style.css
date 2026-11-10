@@ -1027,3 +1027,158 @@ td input[type="number"] { width: 6rem; }
 }
 [data-consumer-hours] li span { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 [data-consumer-hours] small { flex-basis: 100%; color: var(--muted); }
+
+/* ---- Loading and saving indicators ------------------------------------------ */
+[data-progress][hidden], [data-syncing][hidden] { display: none; }
+/* Thin animated bar at the top of the window while something loads or is being sent. */
+[data-progress] {
+	position: fixed;
+	inset: 0 0 auto 0;
+	z-index: 100;
+	height: 3px;
+	overflow: hidden;
+	background: color-mix(in srgb, var(--pine) 18%, transparent);
+	pointer-events: none;
+}
+[data-progress]::before {
+	content: "";
+	position: absolute;
+	inset: 0 auto 0 0;
+	width: 35%;
+	background: var(--pine);
+	animation: progress-slide 1.1s ease-in-out infinite;
+}
+@keyframes progress-slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+
+[data-spinner] {
+	display: inline-block;
+	flex: none;
+	width: 1em;
+	height: 1em;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	vertical-align: -0.15em;
+	animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+[data-loading] { display: flex; align-items: center; gap: 0.5rem; color: var(--muted); }
+
+/* Changes already shown on screen, still being saved */
+[data-syncing] {
+	position: fixed;
+	right: 1rem;
+	bottom: 1rem;
+	z-index: 60;
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	margin: 0;
+	padding: 0.4rem 0.8rem;
+	font-size: 0.8125rem;
+	color: var(--pine);
+	background: var(--surface);
+	border: 1px solid var(--pine);
+	box-shadow: 0 2px 8px rgb(0 0 0 / 0.12);
+}
+
+/* The button whose action is running shows a spinner after its label. */
+button[aria-busy="true"]:not([data-event]) { cursor: progress; }
+button[aria-busy="true"]:not([data-event])::after {
+	content: "";
+	width: 0.9em;
+	height: 0.9em;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: spin 0.7s linear infinite;
+}
+
+/* Agenda being loaded: a spinner next to the period; the grid stays usable (it already shows the repeated slots). */
+[data-range] [data-spinner] { margin-left: 0.5rem; color: var(--pine); }
+
+/* Event drawn before the server confirmed it */
+[data-event][data-pending] { opacity: 0.6; cursor: progress; }
+[data-event][data-pending] b::after {
+	content: "";
+	display: inline-block;
+	width: 0.7em;
+	height: 0.7em;
+	margin-left: 0.3em;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: spin 0.7s linear infinite;
+}
+
+/* Occurrence of a weekly repetition, not generated yet */
+[data-event][data-virtual], [data-legend] i[data-virtual] { opacity: 0.75; border-style: dotted; }
+[data-legend] i[data-kind="dispo"][data-virtual] { border-width: 2px; }
+
+/* ---- Weekly repetitions ("Répétition automatique") --------------------------- */
+[data-generators] { margin: 1rem 0 1.25rem; }
+[data-generators] h2 { margin: 0 0 0.25rem; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+[data-generators] > p { margin: 0 0 0.75rem; }
+[data-generators] ul { list-style: none; margin: 0 0 1rem; padding: 0; border-top: 1px solid var(--line); }
+[data-generators] li {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem 1rem;
+	padding: 0.6rem 0.75rem;
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-top: 0;
+}
+[data-generators] li[aria-busy="true"] { opacity: 0.6; }
+[data-generators] li > div { display: grid; gap: 0.15rem; min-width: 0; }
+[data-generators] li small { overflow-wrap: anywhere; }
+[data-cancellations] { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; margin: 0.25rem 0 0; font-size: 0.8125rem; color: var(--muted); }
+[data-cancellations] [data-chip] { min-height: 1.8rem; padding: 0 0.6rem; text-decoration: line-through; }
+form[data-generator-form] {
+	grid-template-columns: repeat(auto-fill, minmax(min(100%, 10rem), 1fr));
+	max-width: none;
+	padding: 1rem;
+	background: var(--surface);
+	border: 1px solid var(--line);
+}
+form[data-generator-form] > p { grid-column: 1 / -1; }
+
+/* Slot panel: "Répéter chaque semaine" */
+[data-repeat] { display: grid; gap: 0.5rem; }
+[data-check] { display: flex; align-items: center; gap: 0.5rem; font-weight: 600; }
+[data-check] input { width: 1rem; height: 1rem; min-height: 0; margin: 0; accent-color: var(--pine); }
+
+/* Meeting panel: validation with the duration really spent */
+fieldset[data-done] { display: grid; gap: 0.5rem; margin: 0; padding: 0.75rem; border: 1px solid var(--line); }
+fieldset[data-done] legend { padding: 0 0.25rem; font-size: 0.8125rem; font-weight: 600; }
+
+/* Results: inline validation form */
+form[data-row-actions] { display: inline-flex; flex-wrap: wrap; align-items: end; gap: 0.25rem; margin: 0; max-width: none; }
+form[data-row-actions] label { font-size: 0.75rem; }
+form[data-row-actions] input { width: 5.5rem; }
+
+/* ---- "Habitudes": week template ---------------------------------------------- */
+[data-habits] [data-intro] { margin: 0 0 1rem; max-width: 52rem; color: var(--muted); }
+[data-habits] [data-day-head] { cursor: default; text-transform: capitalize; }
+[data-habits] [data-day-head] b { min-width: 0; height: auto; padding: 0.25rem 0.6rem; font-size: 0.875rem; }
+[data-habits] [data-day-head][data-today] b { border-radius: 999px; }
+/* The other side's habits: shown for reference, behind mine */
+[data-habits] [data-event][data-readonly] { opacity: 0.7; z-index: 0; }
+[data-habits] [data-range] { text-transform: none; }
+
+/* Agent's consumers: the name is a button that copies the access link */
+button[data-name-copy] {
+	--bg: transparent; --bd: transparent; --fg: var(--pine);
+	--hover-bg: var(--pine-soft); --hover-fg: var(--pine); --hover-bd: transparent;
+	min-height: 0;
+	padding: 0.2rem 0.4rem;
+	margin-left: -0.4rem;
+	font-weight: 600;
+	text-align: left;
+	text-decoration: underline;
+	text-underline-offset: 0.15em;
+}
+button[data-name-copy] small { color: inherit; text-decoration: none; }
