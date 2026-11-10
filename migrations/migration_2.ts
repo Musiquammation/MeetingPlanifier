@@ -7,7 +7,7 @@ import type { Migration } from "./index";
 
 const migration: Migration = {
 	version: 2,
-	description: "v1.1.0 : habitudes (générateurs) et durée réelle des rendez-vous",
+	description: "v1.1.0: habits (generators) and actual duration of meetings",
 	up({ addColumn, exec }) {
 		addColumn("meetings", "actual_duration_minutes",
 			"INTEGER CHECK (actual_duration_minutes IS NULL OR (actual_duration_minutes > 0 AND actual_duration_minutes <= 44640))");
