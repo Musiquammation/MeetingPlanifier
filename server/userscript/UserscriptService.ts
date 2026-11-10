@@ -79,14 +79,19 @@ export class UserscriptService {
 	 */
 	buildArgs(type: UserscriptEventType, ctx: UserscriptMeetingContext, actor: Actor | null, test = false, changes: MeetingChanges | null = null): Record<string, unknown> {
 		const m = ctx.meeting;
-		const hours = m.durationMinutes / 60;
+		// Once validated, the meeting lasts the time really spent (when the agent gave it): prices follow it.
+		const minutes = m.actualDurationMinutes ?? m.durationMinutes;
+		const hours = minutes / 60;
 		const meeting = {
 			id: m.id,
 			status: m.status,
 			startAt: m.startAt,
-			endAt: addMinutes(m.startAt, m.durationMinutes),
-			durationMinutes: m.durationMinutes,
+			endAt: addMinutes(m.startAt, minutes),
+			durationMinutes: minutes,
 			durationHours: round2(hours),
+			plannedEndAt: addMinutes(m.startAt, m.durationMinutes),
+			plannedDurationMinutes: m.durationMinutes,
+			actualDurationMinutes: m.actualDurationMinutes,
 			consumer: ctx.consumer.username,
 			company: { id: ctx.company.id, name: ctx.company.name },
 			room: m.roomName,
@@ -141,6 +146,7 @@ export class UserscriptService {
 			meeting: {
 				id: 0, assignationId: 0, availabilityRequestId: null, sourceContractId: null, sourceDisponibilityLove: 1,
 				sourceSuggestionLove: 1, startAt: start.toISOString(), durationMinutes: 60,
+				actualDurationMinutes: type === "valid-meeting" ? 45 : null,
 				status: type === "cancel-meeting" ? "canceledBy" : type === "valid-meeting" ? "done" : "pending",
 				roomCompanyId: null, roomName: "Salle A", hourlyRate: 32, societyRate: 28, agentHourlyRate: 25, societyHourlyRate: 7,
 				comment: "Example meeting", canceledByRole: type === "cancel-meeting" ? "consumer" : null, canceledById: null,

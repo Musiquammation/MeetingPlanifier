@@ -22,7 +22,7 @@ function camelize(value: any): any {
 	return value;
 }
 
-import type { AgentScript, IntercoursePair, ScriptRun } from "./types";
+import type { AgentScript, Generator, GeneratorBody, IntercoursePair, ScriptRun } from "./types";
 
 type Query = Record<string, string | number | boolean | null | undefined>;
 
@@ -156,8 +156,17 @@ export class Fetcher {
 	createMeeting(b: { assignationId: number; startAt: string; durationMinutes: number; roomName: string | null; comment: string; idempotencyKey: string }) {
 		return this.post("/api/meetings/from-availability", b);
 	}
-	patchMeeting(id: number, b: { comment?: string; roomName?: string | null; status?: "done" }) { return this.patch(`/api/meetings/${id}`, b); }
+	/** status "done" validates the meeting; actualDurationMinutes is then the time really spent (default: the booked duration). */
+	patchMeeting(id: number, b: { comment?: string; roomName?: string | null; status?: "done"; actualDurationMinutes?: number | null }) { return this.patch(`/api/meetings/${id}`, b); }
 	cancelMeeting(id: number) { return this.post(`/api/meetings/${id}/cancel`); }
+
+	// ---- Generators (weekly repetition of my hours / my availabilities) ----
+	createGenerator(b: GeneratorBody) { return this.post<Generator>("/api/generators", b); }
+	updateGenerator(id: number, b: GeneratorBody) { return this.patch<Generator>(`/api/generators/${id}`, b); }
+	deleteGenerator(id: number) { return this.del(`/api/generators/${id}`); }
+	/** Cancels one occurrence ("cancelator"), by its local date YYYY-MM-DD. */
+	cancelOccurrence(id: number, occurrence: string) { return this.post<Generator>(`/api/generators/${id}/cancellations`, { occurrence }); }
+	restoreOccurrence(id: number, occurrence: string) { return this.del<Generator>(`/api/generators/${id}/cancellations/${encodeURIComponent(occurrence)}`); }
 
 	// ---- Agent userscript (see USERSCRIPT_API.md) -------------------------
 	script() { return this.get<AgentScript>("/api/agent/script"); }

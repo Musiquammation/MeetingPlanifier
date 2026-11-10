@@ -12,6 +12,10 @@ export interface CalEvent {
 	status?: string;
 	love?: number;
 	editable?: boolean;
+	/** Drawn from a generator, not stored yet (after the generated period, or while the period loads). */
+	virtual?: boolean;
+	/** Change sent to the server, answer not received yet (optimistic display). */
+	pending?: boolean;
 	raw: any;
 }
 
@@ -336,5 +340,51 @@ export class Calendar {
 		const dx = t.clientX - s.x;
 		const dy = t.clientY - s.y;
 		if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 2) { if (dx < 0) this.next(); else this.prev(); }
+	}
+}
+
+/** A Monday (local time): the "Habitudes" page draws this week, whatever the real date. */
+const HABIT_WEEK = new Date(2001, 0, 1);
+
+/**
+ * Week template of the "Habitudes" page: one fixed reference week, days shown by name only (no dates).
+ * Navigation (one day at a time on a phone) wraps inside that week; the weekday of a column is all that matters.
+ */
+export class HabitCalendar extends Calendar {
+	constructor() {
+		super();
+		this.anchor = new Date(HABIT_WEEK);
+	}
+
+	get count(): number { return this.isMobile ? 1 : 7; }
+	get step(): number { return this.isMobile ? 1 : 7; }
+	get first(): Date {
+		if (this.isMobile) return startOfDay(this.anchor);
+		const a = startOfDay(HABIT_WEEK);
+		return addDays(a, -((a.getDay() - this.settings.firstDay + 7) % 7));
+	}
+	get title(): string {
+		if (!this.isMobile) return "Semaine type";
+		const day = this.longDay(this.first);
+		return day.charAt(0).toUpperCase() + day.slice(1);
+	}
+
+	/** Same weekday, inside the reference week. */
+	private wrap(d: Date): Date {
+		const base = startOfDay(HABIT_WEEK);
+		const diff = Math.round((startOfDay(d).getTime() - base.getTime()) / 86_400_000);
+		return addDays(base, ((diff % 7) + 7) % 7);
+	}
+	prev() { this.anchor = this.wrap(addDays(this.anchor, -1)); this.onRange?.(); }
+	next() { this.anchor = this.wrap(addDays(this.anchor, 1)); this.onRange?.(); }
+	today() { this.anchor = this.wrap(new Date()); this.onRange?.(); }
+
+	/** The column of today's weekday is highlighted, with the "now" line. */
+	isToday(d: Date): boolean { return d.getDay() === this.now.getDay(); }
+	longDay(d: Date): string { return d.toLocaleDateString("fr-FR", { weekday: "long" }); }
+	nowMin(day: Date): number | null {
+		if (!this.isToday(day)) return null;
+		const m = this.now.getHours() * 60 + this.now.getMinutes() - this.settings.startHour * 60;
+		return m >= 0 && m <= this.hours.length * 60 ? m : null;
 	}
 }

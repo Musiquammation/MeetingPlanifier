@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { randomInt } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { DATE_RE, isValidTimeZone, occurrences, zonedTime } from "../shared/recurrence";
 
 export type MeetingStatus = "pending" | "done" | "canceledBy";
 export type AgentStatus = "pending" | "active" | "disabled";
@@ -139,6 +140,9 @@ export interface Disponibility {
   startAt: string;
   durationMinutes: number;
   love: number;
+  /** Generator (weekly repetition) that created this row, and the local date of its occurrence; null when added by hand. */
+  generatorId: number | null;
+  generatorOccurrence: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -149,6 +153,8 @@ export interface Suggestion {
   startAt: string;
   durationMinutes: number;
   love: number;
+  generatorId: number | null;
+  generatorOccurrence: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -161,7 +167,10 @@ export interface Meeting {
   sourceDisponibilityLove: number | null;
   sourceSuggestionLove: number | null;
   startAt: string;
+  /** Duration booked. */
   durationMinutes: number;
+  /** Duration really done, given by the agent (or admin) when validating; null = the booked duration. */
+  actualDurationMinutes: number | null;
   status: MeetingStatus;
   roomCompanyId: number | null;
   roomName: string | null;
@@ -179,6 +188,47 @@ export interface Meeting {
   idempotencyKey: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type GeneratorKind = "suggestion" | "disponibility";
+
+/**
+ * Weekly repetition of an interval ("générateur"). The occurrences of the next two weeks are materialized as real
+ * suggestions (agent) or disponibilities (consumer) pointing back to it; later ones only exist on the client.
+ */
+export interface Generator {
+  id: number;
+  kind: GeneratorKind;
+  /** Agent's contract (kind "suggestion"). */
+  contractId: number | null;
+  /** Consumer's assignation and request (kind "disponibility"). */
+  assignationId: number | null;
+  requestId: number | null;
+  weekday: number;
+  startMinute: number;
+  durationMinutes: number;
+  love: number;
+  intervalWeeks: number;
+  timeZone: string;
+  startsOn: string;
+  endsOn: string | null;
+  /** Occurrences starting before this instant were already materialized (or skipped). */
+  generatedUntil: string;
+  /** Local dates of the cancelled occurrences ("cancelators"). */
+  cancellations: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GeneratorInput {
+  weekday: number;
+  startMinute: number;
+  durationMinutes: number;
+  love: number;
+  intervalWeeks: number;
+  timeZone: string;
+  startsOn: string;
+  endsOn: string | null;
 }
 
 export interface RoomAvailability extends Room {
@@ -300,6 +350,8 @@ const MAX_INTERVAL_MINUTES = 60 * 24 * 31;
 /** Default percentage taken by the company on the agent (see Company.societyRate). */
 export const DEFAULT_SOCIETY_RATE = 28;
 const MAX_SOCIETY_RATE = 1000;
+/** Generators materialize their occurrences this many days ahead (the client draws the later ones). */
+export const GENERATION_DAYS = 14;
 /** Two preferences closer than this are considered equal when merging intervals. */
 const LOVE_EPSILON = 1e-9;
 
@@ -515,6 +567,42 @@ CREATE INDEX IF NOT EXISTS idx_meetings_request_status ON meetings(availability_
 CREATE INDEX IF NOT EXISTS idx_meetings_room_start ON meetings(room_company_id, room_name, start_at, status);
 CREATE INDEX IF NOT EXISTS idx_meetings_status_start ON meetings(status, start_at);
 
+-- Weekly repetition of an agent's hours (kind 'suggestion', per contract) or of a consumer's availabilities
+-- (kind 'disponibility', per assignation and request). See shared/recurrence.ts and Database.materializeGenerators.
+CREATE TABLE IF NOT EXISTS generators (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('suggestion', 'disponibility')),
+  contract_id INTEGER,
+  assignation_id INTEGER,
+  request_id INTEGER,
+  weekday INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+  start_minute INTEGER NOT NULL CHECK (start_minute BETWEEN 0 AND 1439),
+  duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0 AND duration_minutes <= 1440),
+  love REAL NOT NULL CHECK (love >= 0 AND love <= 1),
+  interval_weeks INTEGER NOT NULL DEFAULT 1 CHECK (interval_weeks BETWEEN 1 AND 52),
+  time_zone TEXT NOT NULL,
+  starts_on TEXT NOT NULL,
+  ends_on TEXT,
+  generated_until TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK ((kind = 'suggestion' AND contract_id IS NOT NULL AND assignation_id IS NULL)
+      OR (kind = 'disponibility' AND assignation_id IS NOT NULL AND request_id IS NOT NULL AND contract_id IS NULL)),
+  FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE,
+  FOREIGN KEY (assignation_id) REFERENCES assignations(id) ON DELETE CASCADE,
+  FOREIGN KEY (request_id) REFERENCES availability_requests(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_generators_contract ON generators(contract_id);
+CREATE INDEX IF NOT EXISTS idx_generators_assignation ON generators(assignation_id);
+
+-- "Cancelators": occurrences of a generator (by local date) that must not exist.
+CREATE TABLE IF NOT EXISTS generator_cancellations (
+  generator_id INTEGER NOT NULL,
+  occurrence TEXT NOT NULL,
+  PRIMARY KEY (generator_id, occurrence),
+  FOREIGN KEY (generator_id) REFERENCES generators(id) ON DELETE CASCADE
+);
+
 -- Userscript of an agent (see USERSCRIPT_API.md): JS code run in a sandbox on meeting events.
 -- secrets_json is a JSON object { NAME: "value" } that is never sent back to the client.
 CREATE TABLE IF NOT EXISTS agent_scripts (
@@ -664,6 +752,16 @@ END;
   }
   if (!hasColumn("meetings", "society_rate")) {
     this.connection.exec("ALTER TABLE meetings ADD COLUMN society_rate REAL NOT NULL DEFAULT 28 CHECK (society_rate >= 0 AND society_rate <= 1000)");
+  }
+  if (!hasColumn("meetings", "actual_duration_minutes")) {
+    this.connection.exec("ALTER TABLE meetings ADD COLUMN actual_duration_minutes INTEGER CHECK (actual_duration_minutes IS NULL OR (actual_duration_minutes > 0 AND actual_duration_minutes <= 44640))");
+  }
+  for (const table of ["disponibilities", "suggestions"]) {
+    if (!hasColumn(table, "generator_id")) {
+    this.connection.exec(`ALTER TABLE ${table} ADD COLUMN generator_id INTEGER REFERENCES generators(id) ON DELETE SET NULL`);
+    this.connection.exec(`ALTER TABLE ${table} ADD COLUMN generator_occurrence TEXT`);
+    this.connection.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_generator ON ${table}(generator_id, generator_occurrence)`);
+    }
   }
   if (!hasColumn("rooms", "position")) {
     this.connection.exec("ALTER TABLE rooms ADD COLUMN position INTEGER NOT NULL DEFAULT 0");
@@ -1202,6 +1300,8 @@ END;
   id: number;
   agentId: number;
   fidelityId: number;
+  /** Access key of the consumer in this company (link #consumer-welcome?key=…), so the agent can send it. */
+  fidelityKey: string;
   companyId: number;
   companyName: string;
   createdAt: string;
@@ -1210,7 +1310,7 @@ END;
   consumer: Pick<Consumer, "id" | "name" | "surname" | "username">;
   }> {
   const rows = this.connection.prepare(
-    `SELECT a.id, a.agent_id, a.fidelity_id, a.created_at, a.intercourse_minutes, f.company_id, c.name AS company_name,
+    `SELECT a.id, a.agent_id, a.fidelity_id, a.created_at, a.intercourse_minutes, f.key AS fidelity_key, f.company_id, c.name AS company_name,
         co.id AS consumer_id, co.name AS consumer_name, co.surname AS consumer_surname, co.username AS consumer_username
      FROM assignations a
      JOIN fidelities f ON f.id = a.fidelity_id AND f.active = 1
@@ -1220,8 +1320,8 @@ END;
      ORDER BY co.surname COLLATE NOCASE, co.name COLLATE NOCASE`,
   ).all(agentId) as RawRow[];
   return rows.map((row) => ({
-    id: Number(row.id), agentId: Number(row.agent_id), fidelityId: Number(row.fidelity_id), createdAt: String(row.created_at),
-    intercourseMinutes: Number(row.intercourse_minutes ?? 0),
+    id: Number(row.id), agentId: Number(row.agent_id), fidelityId: Number(row.fidelity_id), fidelityKey: String(row.fidelity_key),
+    createdAt: String(row.created_at), intercourseMinutes: Number(row.intercourse_minutes ?? 0),
     companyId: Number(row.company_id), companyName: String(row.company_name),
     consumer: { id: Number(row.consumer_id), name: String(row.consumer_name), surname: String(row.consumer_surname), username: String(row.consumer_username) },
   }));
@@ -1721,7 +1821,7 @@ END;
   getAvailabilityRequestProgress(id: number): AvailabilityRequestProgress | null {
   const row = this.connection.prepare(
     `SELECT r.id, r.assignation_id, r.requested_minutes, r.status, r.created_at, r.updated_at,
-        COALESCE(SUM(CASE WHEN m.status <> 'canceledBy' THEN m.duration_minutes ELSE 0 END), 0) AS scheduled_minutes
+        COALESCE(SUM(CASE WHEN m.status <> 'canceledBy' THEN COALESCE(m.actual_duration_minutes, m.duration_minutes) ELSE 0 END), 0) AS scheduled_minutes
      FROM availability_requests r
      LEFT JOIN meetings m ON m.availability_request_id = r.id
      WHERE r.id = ? GROUP BY r.id`,
@@ -1735,7 +1835,7 @@ END;
   listAvailabilityRequestsForAssignation(assignationId: number): AvailabilityRequestProgress[] {
   const rows = this.connection.prepare(
     `SELECT r.id, r.assignation_id, r.requested_minutes, r.status, r.created_at, r.updated_at,
-        COALESCE(SUM(CASE WHEN m.status <> 'canceledBy' THEN m.duration_minutes ELSE 0 END), 0) AS scheduled_minutes
+        COALESCE(SUM(CASE WHEN m.status <> 'canceledBy' THEN COALESCE(m.actual_duration_minutes, m.duration_minutes) ELSE 0 END), 0) AS scheduled_minutes
      FROM availability_requests r LEFT JOIN meetings m ON m.availability_request_id = r.id
      WHERE r.assignation_id = ? GROUP BY r.id ORDER BY r.created_at DESC`,
   ).all(assignationId) as RawRow[];
@@ -1794,7 +1894,7 @@ END;
 
   getDisponibilityById(id: number): Disponibility | null {
   const row = this.connection.prepare(
-    "SELECT id, assignation_id, request_id, start_at, duration_minutes, love, created_at, updated_at FROM disponibilities WHERE id = ?",
+    "SELECT id, assignation_id, request_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at FROM disponibilities WHERE id = ?",
   ).get(id) as RawRow | undefined;
   return row ? this.mapDisponibility(row) : null;
   }
@@ -1802,7 +1902,7 @@ END;
   listDisponibilitiesForRequest(requestId: number): Disponibility[] {
   this.cleanExpiredIntervals();
   const rows = this.connection.prepare(
-    `SELECT id, assignation_id, request_id, start_at, duration_minutes, love, created_at, updated_at
+    `SELECT id, assignation_id, request_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at
      FROM disponibilities WHERE request_id = ? ORDER BY start_at`,
   ).all(requestId) as RawRow[];
   return rows.map((row) => this.mapDisponibility(row));
@@ -1814,7 +1914,7 @@ END;
   const end = to === undefined ? null : this.normalizeIsoDate(to, "Range end");
   if (start && end && Date.parse(start) >= Date.parse(end)) throw new Error("Range end must be after range start");
   const rows = this.connection.prepare(
-    `SELECT id, assignation_id, request_id, start_at, duration_minutes, love, created_at, updated_at
+    `SELECT id, assignation_id, request_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at
      FROM disponibilities
      WHERE assignation_id = ?
      AND (? IS NULL OR julianday(start_at, '+' || duration_minutes || ' minutes') > julianday(?))
@@ -1831,16 +1931,25 @@ END;
   if (!current) throw new Error("Disponibility not found");
   const startAt = this.normalizeIsoDate(input.startAt, "Disponibility start");
   this.assertNoDisponibilityOverlap(current.assignationId, current.requestId, startAt, input.durationMinutes, id);
-  this.connection.prepare(
-    "UPDATE disponibilities SET start_at = ?, duration_minutes = ?, love = ?, updated_at = ? WHERE id = ?",
-  ).run(startAt, input.durationMinutes, input.love, this.nowIso(), id);
+  this.withTransaction(() => {
+    // An occurrence changed by hand leaves its generator: it is cancelled there, so it is never generated again.
+    this.cancelGeneratedRow(current);
+    this.connection.prepare(
+    "UPDATE disponibilities SET start_at = ?, duration_minutes = ?, love = ?, generator_id = NULL, generator_occurrence = NULL, updated_at = ? WHERE id = ?",
+    ).run(startAt, input.durationMinutes, input.love, this.nowIso(), id);
+  });
   const item = this.getDisponibilityById(id);
   if (!item) throw new Error("Disponibility not found");
   return item;
   }
 
+  /** Deletes an availability; a generated one is also cancelled in its generator (it does not come back). */
   deleteDisponibility(id: number): void {
-  this.connection.prepare("DELETE FROM disponibilities WHERE id = ?").run(id);
+  this.withTransaction(() => {
+    const current = this.getDisponibilityById(id);
+    if (current) this.cancelGeneratedRow(current);
+    this.connection.prepare("DELETE FROM disponibilities WHERE id = ?").run(id);
+  });
   }
 
   createSuggestion(input: CreateSuggestionInput): Suggestion {
@@ -1860,7 +1969,7 @@ END;
 
   getSuggestionById(id: number): Suggestion | null {
   const row = this.connection.prepare(
-    "SELECT id, contract_id, start_at, duration_minutes, love, created_at, updated_at FROM suggestions WHERE id = ?",
+    "SELECT id, contract_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at FROM suggestions WHERE id = ?",
   ).get(id) as RawRow | undefined;
   return row ? this.mapSuggestion(row) : null;
   }
@@ -1871,7 +1980,7 @@ END;
   const end = to === undefined ? null : this.normalizeIsoDate(to, "Range end");
   if (start && end && Date.parse(start) >= Date.parse(end)) throw new Error("Range end must be after range start");
   const rows = this.connection.prepare(
-    `SELECT id, contract_id, start_at, duration_minutes, love, created_at, updated_at
+    `SELECT id, contract_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at
      FROM suggestions
      WHERE contract_id = ?
      AND (? IS NULL OR julianday(start_at, '+' || duration_minutes || ' minutes') > julianday(?))
@@ -1890,16 +1999,288 @@ END;
   if (!contract) throw new Error("Contract not found");
   const startAt = this.normalizeIsoDate(input.startAt, "Suggestion start");
   this.assertNoSuggestionOverlap(contract.agentId, startAt, input.durationMinutes, id);
-  this.connection.prepare(
-    "UPDATE suggestions SET start_at = ?, duration_minutes = ?, love = ?, updated_at = ? WHERE id = ?",
-  ).run(startAt, input.durationMinutes, input.love, this.nowIso(), id);
+  this.withTransaction(() => {
+    this.cancelGeneratedRow(current);
+    this.connection.prepare(
+    "UPDATE suggestions SET start_at = ?, duration_minutes = ?, love = ?, generator_id = NULL, generator_occurrence = NULL, updated_at = ? WHERE id = ?",
+    ).run(startAt, input.durationMinutes, input.love, this.nowIso(), id);
+  });
   const item = this.getSuggestionById(id);
   if (!item) throw new Error("Suggestion not found");
   return item;
   }
 
+  /** Deletes a suggestion; a generated one is also cancelled in its generator (it does not come back). */
   deleteSuggestion(id: number): void {
-  this.connection.prepare("DELETE FROM suggestions WHERE id = ?").run(id);
+  this.withTransaction(() => {
+    const current = this.getSuggestionById(id);
+    if (current) this.cancelGeneratedRow(current);
+    this.connection.prepare("DELETE FROM suggestions WHERE id = ?").run(id);
+  });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Generators: weekly repetition of suggestions (agent) and disponibilities (consumer)
+  // ---------------------------------------------------------------------------
+
+  /** Agent's repetition of his hours for one contract; the next two weeks are generated at once. */
+  createSuggestionGenerator(contractId: number, input: GeneratorInput, now: string | Date = new Date()): Generator {
+  if (!this.getContractById(contractId)) throw new Error("Contract not found");
+  return this.insertGenerator("suggestion", { contractId, assignationId: null, requestId: null }, input, now);
+  }
+
+  /** Consumer's repetition of his availabilities for one assignation (inside one request). */
+  createDisponibilityGenerator(assignationId: number, requestId: number, input: GeneratorInput, now: string | Date = new Date()): Generator {
+  const request = this.getAvailabilityRequest(requestId);
+  if (!request || request.assignationId !== assignationId) throw new Error("Disponibility request and assignation do not match");
+  return this.insertGenerator("disponibility", { contractId: null, assignationId, requestId }, input, now);
+  }
+
+  getGeneratorById(id: number): Generator | null {
+  const row = this.connection.prepare("SELECT * FROM generators WHERE id = ?").get(id) as RawRow | undefined;
+  return row ? this.mapGenerator(row) : null;
+  }
+
+  /** Generators of the agent's own hours, every contract. */
+  listSuggestionGeneratorsForAgent(agentId: number): Generator[] {
+  const rows = this.connection.prepare(
+    `SELECT g.* FROM generators g JOIN contracts c ON c.id = g.contract_id
+     WHERE g.kind = 'suggestion' AND c.agent_id = ? ORDER BY g.weekday, g.start_minute, g.id`,
+  ).all(agentId) as RawRow[];
+  return rows.map((row) => this.mapGenerator(row));
+  }
+
+  /** Generators of the availabilities of the agent's consumers. */
+  listDisponibilityGeneratorsForAgent(agentId: number): Generator[] {
+  const rows = this.connection.prepare(
+    `SELECT g.* FROM generators g JOIN assignations a ON a.id = g.assignation_id
+     WHERE g.kind = 'disponibility' AND a.agent_id = ? ORDER BY g.weekday, g.start_minute, g.id`,
+  ).all(agentId) as RawRow[];
+  return rows.map((row) => this.mapGenerator(row));
+  }
+
+  /** Generators of a consumer's own availabilities (all his assignations). */
+  listDisponibilityGeneratorsForConsumer(consumerId: number): Generator[] {
+  const rows = this.connection.prepare(
+    `SELECT g.* FROM generators g JOIN assignations a ON a.id = g.assignation_id JOIN fidelities f ON f.id = a.fidelity_id
+     WHERE g.kind = 'disponibility' AND f.consumer_id = ? ORDER BY g.weekday, g.start_minute, g.id`,
+  ).all(consumerId) as RawRow[];
+  return rows.map((row) => this.mapGenerator(row));
+  }
+
+  /** Hours generators of the agents assigned to a consumer, one row per assignation (like listAgentSuggestionsForConsumer). */
+  listSuggestionGeneratorsForConsumer(consumerId: number): Array<Generator & { slotAssignationId: number }> {
+  const rows = this.connection.prepare(
+    `SELECT g.*, a.id AS slot_assignation_id FROM generators g
+     JOIN contracts c ON c.id = g.contract_id
+     JOIN assignations a ON a.agent_id = c.agent_id
+     JOIN fidelities f ON f.id = a.fidelity_id AND f.company_id = c.company_id
+     JOIN agents ag ON ag.id = a.agent_id AND ag.status <> 'disabled'
+     WHERE g.kind = 'suggestion' AND f.consumer_id = ? AND f.active = 1
+     ORDER BY g.weekday, g.start_minute, g.id`,
+  ).all(consumerId) as RawRow[];
+  return rows.map((row) => ({ ...this.mapGenerator(row), slotAssignationId: Number(row.slot_assignation_id) }));
+  }
+
+  /**
+   * Changes the rule. The future occurrences it had generated are removed and generated again with the new rule
+   * (occurrences changed by hand were detached from it and stay).
+   */
+  updateGenerator(id: number, input: GeneratorInput, now: string | Date = new Date()): Generator {
+  this.assertGeneratorInput(input);
+  const reference = this.normalizeIsoDate(now, "Current time");
+  return this.withTransaction(() => {
+    const current = this.getGeneratorById(id);
+    if (!current) throw new Error("Generator not found");
+    this.deleteFutureGeneratedRows(current, reference);
+    this.connection.prepare(
+    `UPDATE generators SET weekday = ?, start_minute = ?, duration_minutes = ?, love = ?, interval_weeks = ?, time_zone = ?,
+       starts_on = ?, ends_on = ?, generated_until = ?, updated_at = ? WHERE id = ?`,
+    ).run(input.weekday, input.startMinute, input.durationMinutes, input.love, input.intervalWeeks, input.timeZone,
+    input.startsOn, input.endsOn, reference, this.nowIso(), id);
+    this.materializeGenerator(this.getGeneratorById(id)!, reference, this.horizon(reference));
+    return this.getGeneratorById(id)!;
+  });
+  }
+
+  /** Removes the rule and the future occurrences it generated (past and ongoing ones stay, without generator). */
+  deleteGenerator(id: number, now: string | Date = new Date()): void {
+  const reference = this.normalizeIsoDate(now, "Current time");
+  this.withTransaction(() => {
+    const current = this.getGeneratorById(id);
+    if (!current) return;
+    this.deleteFutureGeneratedRows(current, reference);
+    this.connection.prepare("DELETE FROM generators WHERE id = ?").run(id);
+  });
+  }
+
+  /** "Cancelator": the occurrence of that local date will not exist; a future row already generated for it is removed. */
+  cancelGeneratorOccurrence(id: number, occurrence: string, now: string | Date = new Date()): Generator {
+  if (!DATE_RE.test(occurrence)) throw new Error("Occurrence must be a date (YYYY-MM-DD)");
+  const reference = this.normalizeIsoDate(now, "Current time");
+  return this.withTransaction(() => {
+    const generator = this.getGeneratorById(id);
+    if (!generator) throw new Error("Generator not found");
+    this.connection.prepare("INSERT OR IGNORE INTO generator_cancellations (generator_id, occurrence) VALUES (?, ?)").run(id, occurrence);
+    this.connection.prepare(
+    `DELETE FROM ${this.generatorTable(generator)} WHERE generator_id = ? AND generator_occurrence = ? AND julianday(start_at) > julianday(?)`,
+    ).run(id, occurrence, reference);
+    return this.getGeneratorById(id)!;
+  });
+  }
+
+  /** Removes a cancellation; the occurrence is generated again when it is in the generated period. */
+  restoreGeneratorOccurrence(id: number, occurrence: string, now: string | Date = new Date()): Generator {
+  const reference = this.normalizeIsoDate(now, "Current time");
+  return this.withTransaction(() => {
+    const generator = this.getGeneratorById(id);
+    if (!generator) throw new Error("Generator not found");
+    this.connection.prepare("DELETE FROM generator_cancellations WHERE generator_id = ? AND occurrence = ?").run(id, occurrence);
+    const restored = this.getGeneratorById(id)!;
+    const start = zonedTime(occurrence, restored.startMinute, restored.timeZone);
+    const until = Date.parse(restored.generatedUntil);
+    if (start > Date.parse(reference) && start < until) {
+    for (const occ of occurrences(restored, start, start + 1)) this.insertOccurrence(restored, occ.date, occ.start);
+    }
+    return restored;
+  });
+  }
+
+  /**
+   * Generates the occurrences of every generator up to two weeks from now (or up to `until` when it is later),
+   * as real suggestions / disponibilities pointing to their generator. Called whenever availabilities are read.
+   * Occurrences that are cancelled, already past, or that would overlap an existing interval are skipped.
+   */
+  materializeGenerators(now: string | Date = new Date(), until?: string | Date): number {
+  const reference = this.normalizeIsoDate(now, "Current time");
+  let horizon = this.horizon(reference);
+  if (until !== undefined) horizon = new Date(Math.max(Date.parse(horizon), Date.parse(this.normalizeIsoDate(until, "Generation limit")))).toISOString();
+  const rows = this.connection.prepare(
+    "SELECT * FROM generators WHERE julianday(generated_until) < julianday(?) AND (ends_on IS NULL OR ends_on >= ?)",
+  ).all(horizon, reference.slice(0, 10)) as RawRow[];
+  if (!rows.length) return 0;
+  return this.withTransaction(() => rows.reduce((n, row) => n + this.materializeGenerator(this.mapGenerator(row), reference, horizon), 0));
+  }
+
+  private horizon(reference: string): string {
+  return new Date(Date.parse(reference) + GENERATION_DAYS * 86_400_000).toISOString();
+  }
+
+  private insertGenerator(
+  kind: GeneratorKind,
+  owner: { contractId: number | null; assignationId: number | null; requestId: number | null },
+  input: GeneratorInput,
+  now: string | Date,
+  ): Generator {
+  this.assertGeneratorInput(input);
+  const reference = this.normalizeIsoDate(now, "Current time");
+  return this.withTransaction(() => {
+    const stamp = this.nowIso();
+    // Nothing is generated before the first day of the rule (local midnight) nor before now.
+    const generatedUntil = new Date(Math.max(Date.parse(reference), zonedTime(input.startsOn, 0, input.timeZone))).toISOString();
+    const result = this.connection.prepare(
+    `INSERT INTO generators (kind, contract_id, assignation_id, request_id, weekday, start_minute, duration_minutes, love,
+       interval_weeks, time_zone, starts_on, ends_on, generated_until, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(kind, owner.contractId, owner.assignationId, owner.requestId, input.weekday, input.startMinute, input.durationMinutes,
+    input.love, input.intervalWeeks, input.timeZone, input.startsOn, input.endsOn, generatedUntil, stamp, stamp);
+    const generator = this.getGeneratorById(Number(result.lastInsertRowid))!;
+    this.materializeGenerator(generator, reference, this.horizon(reference));
+    return this.getGeneratorById(generator.id)!;
+  });
+  }
+
+  /** Generates the occurrences of one generator between its generatedUntil (or now) and horizon. */
+  private materializeGenerator(generator: Generator, reference: string, horizon: string): number {
+  const from = Math.max(Date.parse(generator.generatedUntil), Date.parse(reference));
+  const to = Date.parse(horizon);
+  if (to <= from) return 0;
+  let created = 0;
+  const cancelled = new Set(generator.cancellations);
+  for (const occ of occurrences(generator, from, to)) {
+    if (cancelled.has(occ.date)) continue;
+    if (this.insertOccurrence(generator, occ.date, occ.start)) created += 1;
+  }
+  this.connection.prepare("UPDATE generators SET generated_until = ? WHERE id = ?").run(horizon, generator.id);
+  return created;
+  }
+
+  /** Creates the row of one occurrence; false when it would overlap another interval (or the request is closed). */
+  private insertOccurrence(generator: Generator, date: string, start: number): boolean {
+  const startAt = new Date(start).toISOString();
+  const now = this.nowIso();
+  try {
+    if (generator.kind === "suggestion") {
+    const contract = this.getContractById(generator.contractId!);
+    if (!contract) return false;
+    this.assertNoSuggestionOverlap(contract.agentId, startAt, generator.durationMinutes);
+    this.connection.prepare(
+      `INSERT INTO suggestions (contract_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(generator.contractId, startAt, generator.durationMinutes, generator.love, generator.id, date, now, now);
+    } else {
+    const request = this.getAvailabilityRequest(generator.requestId!);
+    if (!request || request.status === "closed") return false;
+    this.assertNoDisponibilityOverlap(generator.assignationId!, generator.requestId!, startAt, generator.durationMinutes);
+    this.connection.prepare(
+      `INSERT INTO disponibilities (assignation_id, request_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(generator.assignationId, generator.requestId, startAt, generator.durationMinutes, generator.love, generator.id, date, now, now);
+    }
+    return true;
+  } catch {
+    return false; // overlaps an interval added by hand (or another generator): that one wins
+  }
+  }
+
+  private generatorTable(generator: Pick<Generator, "kind">): "suggestions" | "disponibilities" {
+  return generator.kind === "suggestion" ? "suggestions" : "disponibilities";
+  }
+
+  private deleteFutureGeneratedRows(generator: Generator, reference: string): void {
+  this.connection.prepare(
+    `DELETE FROM ${this.generatorTable(generator)} WHERE generator_id = ? AND julianday(start_at) > julianday(?)`,
+  ).run(generator.id, reference);
+  }
+
+  /** A generated row is changed or removed by hand: its occurrence is cancelled in the generator. */
+  private cancelGeneratedRow(row: { generatorId: number | null; generatorOccurrence: string | null }): void {
+  if (row.generatorId === null || row.generatorOccurrence === null) return;
+  this.connection.prepare("INSERT OR IGNORE INTO generator_cancellations (generator_id, occurrence) VALUES (?, ?)")
+    .run(row.generatorId, row.generatorOccurrence);
+  }
+
+  private assertGeneratorInput(input: GeneratorInput): void {
+  this.assertInteger(input.weekday, "Weekday", 0);
+  if (input.weekday > 6) throw new Error("Weekday must be between 0 (Sunday) and 6 (Saturday)");
+  this.assertInteger(input.startMinute, "Start minute", 0);
+  if (input.startMinute > 1439) throw new Error("Start minute must be between 0 and 1439");
+  this.assertInteger(input.durationMinutes, "Duration", 1);
+  if (input.durationMinutes > 1440) throw new Error("A repeated interval cannot exceed 24 hours");
+  this.assertLove(input.love);
+  this.assertInteger(input.intervalWeeks, "Interval (weeks)", 1);
+  if (input.intervalWeeks > 52) throw new Error("Interval (weeks) cannot exceed 52");
+  if (!isValidTimeZone(input.timeZone)) throw new Error("Unknown time zone");
+  if (!DATE_RE.test(input.startsOn) || !Number.isFinite(Date.parse(input.startsOn))) throw new Error("Start date must be a date (YYYY-MM-DD)");
+  if (input.endsOn !== null && (!DATE_RE.test(input.endsOn) || !Number.isFinite(Date.parse(input.endsOn)))) throw new Error("End date must be a date (YYYY-MM-DD)");
+  if (input.endsOn !== null && input.endsOn < input.startsOn) throw new Error("End date must be after the start date");
+  }
+
+  private mapGenerator(row: RawRow): Generator {
+  const id = Number(row.id);
+  const cancellations = (this.connection.prepare(
+    "SELECT occurrence FROM generator_cancellations WHERE generator_id = ? ORDER BY occurrence",
+  ).all(id) as RawRow[]).map((r) => String(r.occurrence));
+  const nullableId = (v: RawRow[string]) => v === null || v === undefined ? null : Number(v);
+  return {
+    id, kind: String(row.kind) as GeneratorKind,
+    contractId: nullableId(row.contract_id), assignationId: nullableId(row.assignation_id), requestId: nullableId(row.request_id),
+    weekday: Number(row.weekday), startMinute: Number(row.start_minute), durationMinutes: Number(row.duration_minutes),
+    love: Number(row.love), intervalWeeks: Number(row.interval_weeks), timeZone: String(row.time_zone),
+    startsOn: String(row.starts_on), endsOn: row.ends_on === null || row.ends_on === undefined ? null : String(row.ends_on),
+    generatedUntil: String(row.generated_until), cancellations,
+    createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+  };
   }
 
   /** Trim expired intervals and remove fully expired ones as one atomic operation. */
@@ -2368,10 +2749,15 @@ END;
   });
   }
 
-  markMeetingDone(id: number): Meeting {
+  /**
+   * Marks a pending meeting as done. actualDurationMinutes is the time really spent (it can differ from the booked
+   * duration); null or undefined keeps the booked duration. Prices and request progress use the actual duration.
+   */
+  markMeetingDone(id: number, actualDurationMinutes: number | null = null): Meeting {
+  if (actualDurationMinutes !== null) this.assertDuration(actualDurationMinutes);
   this.connection.prepare(
-    "UPDATE meetings SET status = 'done', updated_at = ? WHERE id = ? AND status = 'pending'",
-  ).run(this.nowIso(), id);
+    "UPDATE meetings SET status = 'done', actual_duration_minutes = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
+  ).run(actualDurationMinutes, this.nowIso(), id);
   const meeting = this.getMeetingById(id);
   if (!meeting) throw new Error("Meeting not found");
   if (meeting.status !== "done") throw new Error("Only pending meetings can be marked as done");
@@ -2782,7 +3168,15 @@ END;
   return {
     id: Number(row.id), assignationId: Number(row.assignation_id), requestId: Number(row.request_id),
     startAt: String(row.start_at), durationMinutes: Number(row.duration_minutes), love: Number(row.love),
+    ...this.mapGeneratorLink(row),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+  };
+  }
+
+  private mapGeneratorLink(row: RawRow): { generatorId: number | null; generatorOccurrence: string | null } {
+  return {
+    generatorId: row.generator_id === null || row.generator_id === undefined ? null : Number(row.generator_id),
+    generatorOccurrence: row.generator_occurrence === null || row.generator_occurrence === undefined ? null : String(row.generator_occurrence),
   };
   }
 
@@ -2790,6 +3184,7 @@ END;
   return {
     id: Number(row.id), contractId: Number(row.contract_id), startAt: String(row.start_at),
     durationMinutes: Number(row.duration_minutes), love: Number(row.love),
+    ...this.mapGeneratorLink(row),
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
   }
@@ -2805,7 +3200,9 @@ END;
     sourceContractId: row.source_contract_id === null || row.source_contract_id === undefined ? null : Number(row.source_contract_id),
     sourceDisponibilityLove: row.source_disponibility_love === null || row.source_disponibility_love === undefined ? null : Number(row.source_disponibility_love),
     sourceSuggestionLove: row.source_suggestion_love === null || row.source_suggestion_love === undefined ? null : Number(row.source_suggestion_love),
-    startAt: String(row.start_at), durationMinutes: Number(row.duration_minutes), status: String(row.status) as MeetingStatus,
+    startAt: String(row.start_at), durationMinutes: Number(row.duration_minutes),
+    actualDurationMinutes: row.actual_duration_minutes === null || row.actual_duration_minutes === undefined ? null : Number(row.actual_duration_minutes),
+    status: String(row.status) as MeetingStatus,
     roomCompanyId: row.room_company_id === null || row.room_company_id === undefined ? null : Number(row.room_company_id),
     roomName: row.room_name === null || row.room_name === undefined ? null : String(row.room_name),
     hourlyRate,

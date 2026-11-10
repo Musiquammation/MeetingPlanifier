@@ -436,6 +436,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  const to = requiredString(req.query.to, "to", 40);
 	  if (!Number.isFinite(Date.parse(from)) || !Number.isFinite(Date.parse(to)) || Date.parse(from) >= Date.parse(to)) return fail(res, 400, "Plage de dates invalide.");
 	  database.cleanExpiredIntervals?.();
+	  database.materializeGenerators();
 	  const s = session(req);
 	  if (s.role === "consumer") {
 		const agents = database.listAssignedAgentsForConsumer(s.id);
@@ -446,6 +447,9 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 		  slots: database.listCompatibleSlotsForConsumer(s.id, from, to),
 		  // The agent's opening hours, whatever the consumer's own availabilities are
 		  agentSlots: database.listAgentSuggestionsForConsumer(s.id, from, to),
+		  // Weekly repetitions: the client draws their occurrences after the generated period (two weeks).
+		  generators: database.listDisponibilityGeneratorsForConsumer(s.id),
+		  agentGenerators: database.listSuggestionGeneratorsForConsumer(s.id).map(publicGenerator),
 		  meetings: assignations.flatMap((a: any) => database.listMeetingsForAssignation(a.id, from, to)).map((m: any) => meetingForRole(m, s.role))
 		});
 	  }
@@ -455,6 +459,8 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 		return res.json({
 		  contracts, assignations,
 		  intercoursePairs: database.listIntercoursePairsForAgent(s.id),
+		  generators: database.listSuggestionGeneratorsForAgent(s.id),
+		  consumerGenerators: database.listDisponibilityGeneratorsForAgent(s.id),
 		  suggestions: contracts.flatMap((c: any) => database.listSuggestionsForContract(c.id, from, to)),
 		  // Requests of the agent's consumers (with the hours still to schedule): used to find who is asking for hours.
 		  requests: assignations.flatMap((a: any) => database.listAvailabilityRequestsForAssignation(a.id)),
@@ -497,6 +503,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
   });
   app.get("/api/disponibilities", auth(), (req, res) => {
 	try {
+	  database.materializeGenerators();
 	  const s = session(req);
 	  if (s.role === "consumer") {
 		const assignationId = positiveInt(req.query.assignationId, "assignationId");
@@ -543,6 +550,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 
   app.get("/api/suggestions", auth(["agent"]), (req, res) => {
 	try {
+	  database.materializeGenerators();
 	  const contracts = database.listContractsForAgent(session(req).id);
 	  return res.json(contracts.flatMap((c: any) => database.listSuggestionsForContract(c.id, req.query.from as string, req.query.to as string)));
 	} catch (e: any) { return fail(res, 400, e.message); }
@@ -611,6 +619,8 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 
 			const t0 = Date.parse(startAt);
 			const t1 = t0 + durationMinutes * 60000;
+			// A meeting after the generated period (two weeks) can sit on a repeated availability: generate up to it.
+			database.materializeGenerators(new Date(), new Date(t1));
 
 			// Check whether consecutive intervals cover the complete requested range.
 			const coversRange = (
@@ -812,6 +822,11 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  const s = session(req);
 	  if (s.role === "agent" && !database.listAssignationsForAgent(s.id).some((a: any) => a.id === (meeting.assignationId ?? meeting.assignation_id))) return fail(res, 403, "Réunion inaccessible.");
 	  if (req.body.status !== undefined && req.body.status !== "done") return fail(res, 400, "Statut non autorisé.");
+	  // Time really spent, given when the meeting is validated (empty = the booked duration).
+	  const rawActual = req.body.actualDurationMinutes;
+	  const actualDuration = rawActual === undefined || rawActual === null || rawActual === "" ? null : positiveInt(rawActual, "actualDurationMinutes");
+	  if (actualDuration !== null && req.body.status !== "done") return fail(res, 400, "La durée réelle se donne en validant le rendez-vous.");
+	  if (actualDuration !== null && actualDuration > 44640) return fail(res, 400, "La durée réelle est trop longue.");
 	  const before = meeting;
 	  if (req.body.comment !== undefined) meeting = database.updateMeetingComment(id, String(req.body.comment).slice(0, 2000));
 	  if (req.body.roomName !== undefined) meeting = database.setMeetingRoom(id, req.body.roomName === null || req.body.roomName === "" ? null : requiredString(req.body.roomName, "roomName", 100));
@@ -820,7 +835,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  if (before.comment !== meeting.comment) changes.comment = { from: before.comment, to: meeting.comment };
 	  if (Object.keys(changes).length) userscripts.dispatch("update-meeting", id, { role: s.role }, changes);
 	  if (req.body.status === "done") {
-		meeting = database.markMeetingDone(id);
+		meeting = database.markMeetingDone(id, actualDuration);
 		userscripts.dispatch("valid-meeting", id, { role: s.role });
 	  }
 	  return res.json(meetingForRole(meeting, s.role));
@@ -840,6 +855,95 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  return res.json(meetingForRole(canceled, s.role));
 	} catch (e: any) { return fail(res, 400, e.message); }
   });
+  // ---- Generators: weekly repetition of the agent's hours / the consumer's availabilities -------------
+  const generatorInput = (body: any) => {
+	const int = (value: unknown, label: string, min: number, max: number) => {
+	  const n = Number(value);
+	  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${label} doit être un entier entre ${min} et ${max}.`);
+	  return n;
+	};
+	const date = (value: unknown, label: string) => {
+	  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value))) throw new Error(`${label} doit être une date (AAAA-MM-JJ).`);
+	  return value;
+	};
+	const love = body.love === undefined ? 0.5 : Number(body.love);
+	if (!Number.isFinite(love) || love < 0 || love > 1) throw new Error("love doit être compris entre 0 et 1.");
+	const timeZone = requiredString(body.timeZone, "timeZone", 64);
+	const startsOn = date(body.startsOn, "startsOn");
+	const endsOn = body.endsOn === undefined || body.endsOn === null || body.endsOn === "" ? null : date(body.endsOn, "endsOn");
+	if (endsOn !== null && endsOn < startsOn) throw new Error("La date de fin doit être après la date de début.");
+	return {
+	  weekday: int(body.weekday, "weekday", 0, 6),
+	  startMinute: int(body.startMinute, "startMinute", 0, 1439),
+	  durationMinutes: int(body.durationMinutes, "durationMinutes", 1, 1440),
+	  love, intervalWeeks: int(body.intervalWeeks ?? 1, "intervalWeeks", 1, 52),
+	  timeZone, startsOn, endsOn,
+	};
+  };
+  /** The generator if the session owns it: the agent his hours, the consumer his availabilities. */
+  const ownedGenerator = (req: Request, id: number) => {
+	const s = session(req);
+	const generator = database.getGeneratorById(id);
+	if (!generator) return null;
+	if (s.role === "agent") return generator.kind === "suggestion" && database.listContractsForAgent(s.id).some((c: any) => c.id === generator.contractId) ? generator : null;
+	return generator.kind === "disponibility" && database.listAssignationsForConsumer(s.id).some((a: any) => a.id === generator.assignationId) ? generator : null;
+  };
+  const generatorError = (e: any) => /time zone/i.test(e?.message ?? "") ? "Fuseau horaire inconnu." : e?.message || "Répétition impossible.";
+
+  app.post("/api/generators", auth(["agent", "consumer"]), (req, res) => {
+	try {
+	  const s = session(req);
+	  const input = generatorInput(req.body);
+	  if (s.role === "agent") {
+		const contractId = positiveInt(req.body.contractId, "contractId");
+		if (!database.listContractsForAgent(s.id).some((c: any) => c.id === contractId)) return fail(res, 403, "Contrat inaccessible.");
+		return res.status(201).json(database.createSuggestionGenerator(contractId, input));
+	  }
+	  const assignationId = positiveInt(req.body.assignationId, "assignationId");
+	  if (!database.listAssignationsForConsumer(s.id).some((a: any) => a.id === assignationId)) return fail(res, 403, "Assignation inaccessible.");
+	  // Same rule as a single availability: without a request, the open one (or a new unlimited one) is used.
+	  let requestId: number;
+	  if (req.body.requestId === undefined || req.body.requestId === null || req.body.requestId === "") {
+		const open = database.listAvailabilityRequestsForAssignation(assignationId).find((r: any) => r.status === "open");
+		requestId = open ? open.id : database.createAvailabilityRequest(assignationId, UNLIMITED_HOURS).id;
+	  } else {
+		requestId = positiveInt(req.body.requestId, "requestId");
+		if (database.getAvailabilityRequest(requestId)?.assignationId !== assignationId) return fail(res, 403, "Demande inaccessible.");
+	  }
+	  return res.status(201).json(database.createDisponibilityGenerator(assignationId, requestId, input));
+	} catch (e: any) { return fail(res, 400, generatorError(e)); }
+  });
+  app.patch("/api/generators/:id", auth(["agent", "consumer"]), (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (!ownedGenerator(req, id)) return fail(res, 404, "Répétition introuvable.");
+	  return res.json(database.updateGenerator(id, generatorInput(req.body)));
+	} catch (e: any) { return fail(res, 400, generatorError(e)); }
+  });
+  app.delete("/api/generators/:id", auth(["agent", "consumer"]), (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (!ownedGenerator(req, id)) return fail(res, 404, "Répétition introuvable.");
+	  database.deleteGenerator(id);
+	  return res.json({ ok: true });
+	} catch (e: any) { return fail(res, 400, generatorError(e)); }
+  });
+  /** Cancels one occurrence (by its local date): it is not generated, and removed if it already was. */
+  app.post("/api/generators/:id/cancellations", auth(["agent", "consumer"]), (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (!ownedGenerator(req, id)) return fail(res, 404, "Répétition introuvable.");
+	  return res.status(201).json(database.cancelGeneratorOccurrence(id, requiredString(req.body.occurrence, "occurrence", 10)));
+	} catch (e: any) { return fail(res, 400, generatorError(e)); }
+  });
+  app.delete("/api/generators/:id/cancellations/:occurrence", auth(["agent", "consumer"]), (req, res) => {
+	try {
+	  const id = positiveInt(req.params.id, "id");
+	  if (!ownedGenerator(req, id)) return fail(res, 404, "Répétition introuvable.");
+	  return res.json(database.restoreGeneratorOccurrence(id, String(req.params.occurrence)));
+	} catch (e: any) { return fail(res, 400, generatorError(e)); }
+  });
+
   // ---- Agent userscript (sandboxed JS run on meeting events, see USERSCRIPT_API.md) ----------------
   const agentOnly = auth(["agent"]);
   /** Secret values are write-only: only their names are sent back. */
@@ -902,6 +1006,15 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	try { return res.json(database.listAgentScriptRuns(session(req).id)); }
 	catch (e: any) { return fail(res, 400, e.message); }
   });
+}
+
+/** What a consumer may know about his agent's repeated hours: when, not how much he likes them. */
+function publicGenerator(g: any): any {
+  return {
+	id: g.id, kind: g.kind, assignationId: g.slotAssignationId, contractId: g.contractId, weekday: g.weekday, startMinute: g.startMinute,
+	durationMinutes: g.durationMinutes, intervalWeeks: g.intervalWeeks, timeZone: g.timeZone, startsOn: g.startsOn, endsOn: g.endsOn,
+	generatedUntil: g.generatedUntil, cancellations: g.cancellations
+  };
 }
 
 function requirePasswordHash(password: string): string {

@@ -23,7 +23,7 @@ and may return a value (the value is serialized to JSON and shown in the executi
 | `new-meeting`     | The agent books a meeting.                                                     | agent                          |
 | `update-meeting`  | The room or the comment of a meeting changes (`event.changes` says what changed). | agent or admin (also the admin's automatic room assignment) |
 | `cancel-meeting`  | A pending meeting is cancelled.                                                | agent, consumer or admin       |
-| `valid-meeting`   | A meeting is marked as done (validated).                                       | agent or admin                 |
+| `valid-meeting`   | A meeting is marked as done (validated), with the time really spent.           | agent or admin                 |
 
 `args.event.actor.role` says who triggered the event. The events of one agent are run one after the
 other, in the order they happened, so a script never sees an `update-meeting` before the `new-meeting`
@@ -196,9 +196,12 @@ meeting, never the agent's other consumers.
 	id: number;
 	status: "pending" | "done" | "canceledBy";
 	startAt: string;            // ISO 8601, UTC
-	endAt: string;              // ISO 8601, UTC
-	durationMinutes: number;
-	durationHours: number;      // rounded to 2 decimals
+	endAt: string;              // ISO 8601, UTC: startAt + durationMinutes
+	durationMinutes: number;    // actual duration once validated with one, else the booked duration
+	durationHours: number;      // durationMinutes / 60, rounded to 2 decimals
+	plannedEndAt: string;       // ISO 8601, UTC: end of the booked slot
+	plannedDurationMinutes: number;      // duration booked
+	actualDurationMinutes: number | null; // duration really spent, given when validating (null before, or when not given)
 	consumer: string;           // username: key of args.consumers
 	company: { id: number; name: string };
 	room: string | null;
@@ -207,7 +210,7 @@ meeting, never the agent's other consumers.
 	hourlyRate: number;         // hourly price paid by the consumer (company share included)
 	agentHourlyRate: number;    // hourlyRate / (1 + societyCommission)
 	societyHourlyRate: number;  // hourlyRate - agentHourlyRate
-	price: number;              // hourlyRate × durationHours
+	price: number;              // hourlyRate × durationHours (so the actual duration once validated)
 	agentAmount: number;        // what the agent earns for this meeting
 	societyAmount: number;      // what the company keeps
 	societyCommission: number;  // ratio applied to THIS meeting (can differ from args.societyCommission once the meeting is done)
@@ -220,12 +223,16 @@ meeting, never the agent's other consumers.
 }
 ```
 
+When a meeting is validated, the agent (or the admin) can change the duration really spent: a 60-minute
+booking validated with 45 minutes gives `durationMinutes: 45`, `plannedDurationMinutes: 60`,
+`actualDurationMinutes: 45`, and `price`, `agentAmount` and `societyAmount` are computed on 45 minutes.
+
 All amounts are in euros, rounded to cents. The price includes the company's share:
 `price = agentAmount × (1 + societyCommission)`. For example, 32 € paid gives
 25 € to the agent and 7 € to the company with a commission of 0.28.
 
 When the test runs on the **sample event** (no meeting selected), `meeting.id` is `0` and
-the consumer, company and pricing are made up.
+the consumer, company and pricing are made up (a sample `valid-meeting` has a 60-minute booking done in 45 minutes).
 
 ---
 

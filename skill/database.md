@@ -107,8 +107,21 @@ Les types d’entrée et de sortie (`Company`, `Agent`, `Meeting`, etc.) sont d�
 - **`listMeetingsForCompany(companyId: number, from?: string | Date, to?: string | Date): Meeting[]`** — Liste les réunions d’une entreprise, avec filtre de plage facultatif.
 - **`updateMeetingComment(id: number, comment: string): Meeting`** — Met à jour le commentaire d’une réunion.
 - **`setMeetingRoom(id: number, roomName: string | null): Meeting`** — Affecte ou retire une salle à une réunion.
-- **`markMeetingDone(id: number): Meeting`** — Marque une réunion comme terminée.
+- **`markMeetingDone(id: number, actualDurationMinutes: number | null = null): Meeting`** — Marque une réunion comme terminée, avec la durée réellement effectuée (`null` = durée réservée). Les prix et la progression des demandes utilisent cette durée réelle.
 - **`cancelMeeting(id: number, actorRole: Role, actorId: number, now: string | Date = new Date()): Meeting`** — Annule une réunion en enregistrant le rôle et l’identifiant de l’auteur.
+
+### Répétition automatique (générateurs)
+
+Un générateur répète un créneau chaque semaine (ou toutes les N semaines) : horaires de l’agent (`kind = "suggestion"`, par contrat) ou disponibilités du consommateur (`kind = "disponibility"`, par assignation et demande). L’heure est une heure locale dans `timeZone`. Les occurrences des deux prochaines semaines (`GENERATION_DAYS`) sont créées comme de vraies lignes avec `generatorId` et `generatorOccurrence` (date locale) ; le client dessine les suivantes à la volée (`shared/recurrence.ts`).
+
+- **`createSuggestionGenerator(contractId, input: GeneratorInput): Generator`** / **`createDisponibilityGenerator(assignationId, requestId, input): Generator`** — Crée la règle et génère ses occurrences à venir.
+- **`getGeneratorById(id)`**, **`listSuggestionGeneratorsForAgent(agentId)`**, **`listDisponibilityGeneratorsForAgent(agentId)`**, **`listDisponibilityGeneratorsForConsumer(consumerId)`**, **`listSuggestionGeneratorsForConsumer(consumerId)`** — Lecture des règles (avec leurs annulations).
+- **`updateGenerator(id, input)`** — Change la règle : les occurrences futures encore liées sont supprimées puis regénérées.
+- **`deleteGenerator(id)`** — Supprime la règle et ses occurrences futures.
+- **`cancelGeneratorOccurrence(id, date)`** / **`restoreGeneratorOccurrence(id, date)`** — « Cancelator » : annule (ou rétablit) l’occurrence d’une date locale.
+- **`materializeGenerators(now?, until?)`** — Génère les occurrences jusqu’à deux semaines (ou jusqu’à `until`). Appelée à chaque lecture des disponibilités et avant une réservation.
+
+Modifier ou supprimer à la main une ligne générée l’annule dans son générateur (elle n’est jamais recréée).
 
 ## Remarques
 

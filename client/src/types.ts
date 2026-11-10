@@ -9,8 +9,8 @@ export type Page =
 	| "admin-welcome" | "admin-login" | "admin-signup"
 	| "admin-dashboard" | "admin-companies" | "admin-consumers" | "admin-agents" | "admin-rooms" | "admin-packages" | "admin-results"
 	| "agent-welcome" | "agent-login" | "agent-signup"
-	| "agent-dashboard" | "agent-companies" | "agent-consumers" | "agent-agenda" | "agent-results" | "agent-script"
-	| "consumer-welcome" | "consumer-access" | "consumer-dashboard" | "consumer-agenda";
+	| "agent-dashboard" | "agent-companies" | "agent-consumers" | "agent-agenda" | "agent-habits" | "agent-results" | "agent-script"
+	| "consumer-welcome" | "consumer-access" | "consumer-dashboard" | "consumer-agenda" | "consumer-habits";
 
 /** societyRate (percent) is only sent to administrators: the company takes it on top of the agent's amount (default 28). */
 export interface Company { id: Id; name: string; societyRate?: number }
@@ -33,7 +33,10 @@ export interface Meeting {
 	id: Id;
 	assignationId: Id;
 	startAt: string;
+	/** Duration booked. */
 	durationMinutes: number;
+	/** Duration really spent, given when the meeting was validated (null = the booked duration). */
+	actualDurationMinutes?: number | null;
 	status: "pending" | "done" | "canceledBy";
 	room?: string | null;
 	roomName?: string | null;
@@ -46,6 +49,37 @@ export interface Meeting {
 	/** Hourly amount kept by the company (admin only). */
 	societyHourlyRate?: number;
 	comment?: string;
+}
+
+/**
+ * Weekly repetition ("générateur") of the agent's hours (kind "suggestion") or of a consumer's availabilities
+ * (kind "disponibility"). The server generates the next two weeks; the agenda draws the later occurrences itself.
+ */
+export interface Generator {
+	id: Id;
+	kind: "suggestion" | "disponibility";
+	contractId: Id | null;
+	assignationId: Id | null;
+	requestId?: Id | null;
+	weekday: number;
+	startMinute: number;
+	durationMinutes: number;
+	/** Not sent to a consumer for his agent's hours. */
+	love?: number;
+	intervalWeeks: number;
+	timeZone: string;
+	startsOn: string;
+	endsOn: string | null;
+	/** Occurrences starting before this instant exist as real rows (or were skipped). */
+	generatedUntil: string;
+	/** Local dates of the cancelled occurrences. */
+	cancellations: string[];
+}
+
+export interface GeneratorBody {
+	weekday: number; startMinute: number; durationMinutes: number; love: number; intervalWeeks: number;
+	timeZone: string; startsOn: string; endsOn: string | null;
+	contractId?: number; assignationId?: number; requestId?: number;
 }
 
 /** A package ("formule") is a named hourly rate. */

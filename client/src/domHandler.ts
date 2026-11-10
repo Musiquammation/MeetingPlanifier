@@ -3,11 +3,12 @@
 // `dom` is a reactive singleton: Alpine.data("app", () => dom) then Alpine.start().
 
 import Alpine from "alpinejs";
-import { Calendar, addDays, toLocalInput, type CalEvent, type EventKind } from "./Calendar";
+import { Calendar, HabitCalendar, addDays, toLocalInput, type CalEvent, type EventKind } from "./Calendar";
 import { ResultsView } from "./Results";
 import { fetcher } from "./fetcher";
 import { plan } from "./Planner";
-import type { AgentScript, AvailabilityRequest, Company, IntercoursePair, Meeting, Package, Page, Proposal, Role, Room, ScriptRun } from "./types";
+import type { AgentScript, AvailabilityRequest, Company, Generator, GeneratorBody, IntercoursePair, Meeting, Package, Page, Proposal, Role, Room, ScriptRun } from "./types";
+import { describe, localDate, occurrences, WEEKDAYS_FR } from "../../shared/recurrence";
 
 /** Required role per page (null = public page). */
 const PAGES: Record<Page, Role | null> = {
@@ -16,9 +17,9 @@ const PAGES: Record<Page, Role | null> = {
 	"admin-dashboard": "admin", "admin-companies": "admin", "admin-consumers": "admin", "admin-agents": "admin", "admin-rooms": "admin",
 	"admin-packages": "admin", "admin-results": "admin",
 	"agent-welcome": null, "agent-login": null, "agent-signup": null,
-	"agent-dashboard": "agent", "agent-companies": "agent", "agent-consumers": "agent", "agent-agenda": "agent", "agent-results": "agent", "agent-script": "agent",
+	"agent-dashboard": "agent", "agent-companies": "agent", "agent-consumers": "agent", "agent-agenda": "agent", "agent-habits": "agent", "agent-results": "agent", "agent-script": "agent",
 	"consumer-welcome": null, "consumer-access": null,
-	"consumer-dashboard": "consumer", "consumer-agenda": "consumer"
+	"consumer-dashboard": "consumer", "consumer-agenda": "consumer", "consumer-habits": "consumer"
 };
 /** Period wide enough to get every meeting, whatever its date (results pages). */
 const ALL_FROM = "2000-01-01T00:00:00.000Z";
@@ -59,6 +60,18 @@ async function userscript(env, args) {
 const SCRIPT_EVENTS: Record<string, string> = { "new-meeting": "Nouveau rendez-vous", "update-meeting": "Rendez-vous modifié (salle, commentaire)", "cancel-meeting": "Rendez-vous annulé", "valid-meeting": "Rendez-vous validé (terminé)" };
 const RUN_STATUS: Record<string, string> = { ok: "Réussi", error: "Erreur", timeout: "Temps dépassé", skipped: "Ignoré" };
 
+/** Temporary id of a row created on screen before the server answered (real ids are positive). */
+const tempId = () => -1 - Math.floor(Math.random() * 1e9);
+/** Time zone of the browser: the repetitions keep their wall-clock time in it. */
+const browserTimeZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; } };
+const hhmm = (minutes: number) => `${String(Math.floor(minutes / 60) % 24).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+/** Form of the "Répétition automatique" section. */
+const newGenForm = () => {
+	const today = new Date();
+	return { id: null as number | null, weekday: today.getDay(), start: "09:00", duration: 120, love: 0.5, intervalWeeks: 1,
+		startsOn: localDate(today.getTime(), browserTimeZone()), endsOn: "", contractId: null as number | null };
+};
+
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
 const horizon = (days: number) => ({ from: new Date().toISOString(), to: addDays(new Date(), days).toISOString() });
 
@@ -71,6 +84,8 @@ export class DomHandler {
 
 	busy = false; // a submit is running (blocks double clicks)
 	loading = false; // data is being loaded
+	/** Changes already shown on screen and still being sent to the server (optimistic updates). */
+	syncing = 0
 	error = "";
 	notice = "";
 	flash = ""; // message to show after the next navigation
@@ -121,7 +136,27 @@ export class DomHandler {
 	secretForm = { name: "", value: "" };
 	openRun: number | null = null;
 
+	// Weekly repetitions ("générateurs"): mine, and the other side's (the consumers' for the agent, the agents' for the consumer)
+	generators: Generator[] = [];
+	otherGenerators: Generator[] = [];
+	/** "Habitudes" page: the week template, and the habit to open once the page is loaded. */
+	habitCal = new HabitCalendar();
+	private habitToEdit: number | null = null;
+	/** The rows of the visible period came from the server (until then the agenda shows what the generators give). */
+	rangeLoaded = false;
+	/** Occurrences drawn from the generators for the visible period (also used by the booking check and the planner). */
+	virtualDispos: any[] = [];
+	virtualSuggestions: any[] = [];
+	// Results page: meeting being validated, with the duration really spent
+	doneEdit: { id: number; minutes: number } | null = null;
+
 	cal = new Calendar();
+
+	private agendaSeq = 0;
+	private loadedRange = "";
+	private syncChain: Promise<unknown> = Promise.resolve();
+	private resyncWanted = false;
+	private lastButton: { el: HTMLButtonElement; at: number } | null = null;
 
 	/** Alpine looks methods up on own properties: bind them to the reactive proxy. */
 	bindAll(self: this): void {
@@ -139,6 +174,11 @@ export class DomHandler {
 			this.go("main");
 		};
 		window.addEventListener("hashchange", () => void this.route());
+		// Remembers the button that started an action, so it can show a spinner while the action runs (see run()).
+		document.addEventListener("click", (e) => {
+			const el = (e.target as Element | null)?.closest?.("button");
+			this.lastButton = el ? { el, at: Date.now() } : null;
+		}, true);
 
 		// x-place copies { "--name": value } onto the element as CSS custom properties,
 		// so positions live in style.css rules and never in the HTML.
@@ -183,6 +223,8 @@ export class DomHandler {
 		this.onlyRequesters = false;
 		this.intercoursePairs = []; this.openIntercourse = null; this.proposals = []; this.cal.gaps = [];
 		this.script = null; this.scriptCode = ""; this.scriptRuns = []; this.scriptTest = { type: "new-meeting", meetingId: "", last: null };
+		this.generators = []; this.otherGenerators = []; this.habitCal.events = []; this.habitToEdit = null; this.virtualDispos = []; this.virtualSuggestions = [];
+		this.rangeLoaded = false; this.loadedRange = ""; this.doneEdit = null;
 	}
 
 	async logout(): Promise<void> {
@@ -209,7 +251,7 @@ export class DomHandler {
 		if (location.hash !== `#${page}`) history.replaceState(null, "", `#${page}`);
 
 		this.page = page;
-		this.form = {}; this.created = null; this.panel = null; this.results = [];
+		this.form = {}; this.created = null; this.panel = null; this.results = []; this.doneEdit = null;
 		this.notice = ""; this.error = this.flash; this.flash = "";
 		this.ready = true;
 		window.scrollTo(0, 0);
@@ -238,13 +280,77 @@ export class DomHandler {
 		if (this.busy) return;
 		this.busy = true; this.error = ""; this.notice = "";
 		if (this.panel) this.panel.error = "";
+		// The button that was just clicked shows a spinner until the server answers.
+		const button = this.lastButton && Date.now() - this.lastButton.at < 1000 ? this.lastButton.el : null;
+		button?.setAttribute("aria-busy", "true");
 		try {
 			await fn();
 			if (ok) this.notice = ok;
 		} catch (e: any) {
 			const msg = e?.message ?? "Une erreur est survenue.";
 			if (this.panel) this.panel.error = msg; else this.error = msg;
-		} finally { this.busy = false; }
+		} finally {
+			this.busy = false;
+			button?.removeAttribute("aria-busy");
+		}
+	}
+
+	/**
+	 * Optimistic change, for what the browser can guess without the server: `apply` changes the screen at once and
+	 * returns how to undo it, `send` talks to the server in the background. Sends run one after the other, in order.
+	 * If the server refuses, the change is undone and the error shown. Once nothing is left to send, the page data is
+	 * reloaded quietly (no spinner) so the screen matches the server (remaining hours, generated rows…).
+	 */
+	private optimistic(apply: () => (() => void) | void, send: () => Promise<void>, ok = ""): Promise<void> {
+		this.error = ""; this.notice = "";
+		const page = this.page;
+		const undo = apply();
+		this.redraw();
+		this.syncing += 1;
+		const task = this.syncChain.then(send).then(
+			() => { if (ok && this.page === page) this.notice = ok; },
+			(e: any) => {
+				undo?.();
+				if (this.page === page) this.error = e?.message ?? "Une erreur est survenue : la modification a été annulée.";
+			},
+		).finally(() => {
+			this.syncing -= 1;
+			this.resyncWanted = true;
+			this.redraw();
+			if (!this.syncing && this.resyncWanted && this.page === page) {
+				this.resyncWanted = false;
+				void this.quietReload();
+			}
+		});
+		this.syncChain = task;
+		return task;
+	}
+
+	/** Rebuilds what is drawn from the data (the calendar is not reactive to the arrays it is built from). */
+	private redraw(): void {
+		if (this.page === "agent-agenda" || this.page === "consumer-agenda") this.cal.events = this.buildEvents();
+		if (this.page === "agent-habits" || this.page === "consumer-habits") this.habitCal.events = this.buildHabitEvents();
+	}
+
+	/** Reloads the data of the page without any spinner (after optimistic changes). */
+	private async quietReload(): Promise<void> {
+		try {
+			if (this.page === "agent-agenda" || this.page === "consumer-agenda") await this.refreshAgenda(true);
+			else if (this.page === "agent-habits" || this.page === "consumer-habits") await this.loadHabits();
+			else if (this.page === "admin-results" || this.page === "agent-results") await this.reloadResults();
+			else if (this.page === "admin-dashboard") { const { from, to } = horizon(14); this.meetings = (await fetcher.agenda(from, to)).meetings ?? []; }
+		} catch { /* the next navigation reloads anyway */ }
+	}
+
+	/** Runs synchronous checks of a form; the message goes to the panel (or the page) and false is returned. */
+	private check(fn: () => void): boolean {
+		this.error = "";
+		if (this.panel) this.panel.error = "";
+		try { fn(); return true; } catch (e: any) {
+			const msg = e?.message ?? "Valeur invalide.";
+			if (this.panel) this.panel.error = msg; else this.error = msg;
+			return false;
+		}
 	}
 
 	private async load(fn: () => Promise<void>): Promise<void> {
@@ -321,6 +427,8 @@ export class DomHandler {
 					this.meetings = (agenda.meetings ?? []).slice().sort((a: Meeting, b: Meeting) => Date.parse(b.startAt) - Date.parse(a.startAt));
 					this.assignations = agenda.assignations ?? [];
 				});
+			case "agent-habits": case "consumer-habits":
+				return this.openHabits();
 			case "agent-agenda": case "consumer-agenda":
 				return this.openAgenda();
 		}
@@ -471,16 +579,14 @@ export class DomHandler {
 
 	/** Admin dashboard: give (or remove) the room of an upcoming meeting. */
 	async setMeetingRoom(m: Meeting, select: HTMLSelectElement) {
-		await this.run(async () => {
-			try {
-				await fetcher.patchMeeting(m.id, { roomName: select.value || null });
-			} catch (e) {
-				select.value = m.roomName ?? ""; // show the real room again
-				throw e;
-			}
-			const { from, to } = horizon(14);
-			this.meetings = (await fetcher.agenda(from, to)).meetings ?? [];
-		}, "Salle mise à jour.");
+		const id = m.id, before = m.roomName ?? null, roomName = select.value || null;
+		await this.optimistic(() => {
+			this.meetings = this.meetings.map((x) => x.id === id ? { ...x, roomName } : x);
+			return () => {
+				this.meetings = this.meetings.map((x) => x.id === id ? { ...x, roomName: before } : x);
+				select.value = before ?? ""; // show the real room again
+			};
+		}, async () => { await fetcher.patchMeeting(id, { roomName }); }, "Salle mise à jour.");
 	}
 
 	// ---- Agent script (userscript run on the server, in a sandbox) -------------------
@@ -838,16 +944,35 @@ export class DomHandler {
 		this.res.setData(this.res.mode, a.meetings ?? [], this.res.assignations);
 	}
 
-	/** The only changes allowed from the results: validate, cancel or comment a pending meeting. */
-	async resultDone(id: number) {
-		await this.run(async () => { await fetcher.patchMeeting(id, { status: "done" }); await this.reloadResults(); }, "Rendez-vous marqué comme terminé.");
+	/** Changes one meeting of the results on screen; returns how to undo it. */
+	private patchResult(id: number, change: Partial<Meeting>): () => void {
+		const before = this.res.meetings.find((m) => m.id === id);
+		this.res.setData(this.res.mode, this.res.meetings.map((m) => m.id === id ? { ...m, ...change } : m), this.res.assignations);
+		return () => { if (before) this.res.setData(this.res.mode, this.res.meetings.map((m) => m.id === id ? before : m), this.res.assignations); };
+	}
+
+	/** The only changes allowed from the results: validate (with the duration really spent), cancel or comment a pending meeting. */
+	resultDone(id: number) {
+		const m = this.res.meetings.find((x) => x.id === id);
+		this.doneEdit = { id, minutes: m?.durationMinutes ?? 60 };
+	}
+	async resultConfirmDone() {
+		const edit = this.doneEdit;
+		if (!edit) return;
+		const minutes = Number(edit.minutes);
+		if (!this.check(() => { if (!Number.isInteger(minutes) || minutes <= 0) throw new Error("La durée réelle est un nombre entier de minutes, supérieur à 0."); })) return;
+		this.doneEdit = null;
+		const planned = this.res.meetings.find((x) => x.id === edit.id)?.durationMinutes;
+		const actual = minutes === planned ? null : minutes;
+		await this.optimistic(() => this.patchResult(edit.id, { status: "done", actualDurationMinutes: actual }),
+			async () => { await fetcher.patchMeeting(edit.id, { status: "done", actualDurationMinutes: actual }); }, "Rendez-vous marqué comme terminé.");
 	}
 	async resultCancel(id: number) {
 		if (!confirm("Annuler ce rendez-vous ?")) return;
-		await this.run(async () => { await fetcher.cancelMeeting(id); await this.reloadResults(); }, "Rendez-vous annulé.");
+		await this.optimistic(() => this.patchResult(id, { status: "canceledBy" }), async () => { await fetcher.cancelMeeting(id); }, "Rendez-vous annulé.");
 	}
 	async resultComment(id: number, text: string) {
-		await this.run(async () => { await fetcher.patchMeeting(id, { comment: text }); await this.reloadResults(); }, "Commentaire enregistré.");
+		await this.optimistic(() => this.patchResult(id, { comment: text }), async () => { await fetcher.patchMeeting(id, { comment: text }); }, "Commentaire enregistré.");
 	}
 
 	// ---- Society rate (page Société) ---------------------------------------------------------------
@@ -885,23 +1010,44 @@ export class DomHandler {
 		await this.refreshAgenda();
 	}
 
-	async refreshAgenda(): Promise<void> {
-		await this.load(async () => {
-			const { from, to } = this.cal.range;
+	/**
+	 * Loads the visible period. Until the answer arrives, the period is drawn from the generators already known
+	 * (weekly repetitions), so changing week shows the usual hours at once. `silent` reloads without the spinner.
+	 */
+	async refreshAgenda(silent = false): Promise<void> {
+		const { from, to } = this.cal.range;
+		const key = `${this.selAssign}|${from}|${to}`;
+		const seq = ++this.agendaSeq;
+		if (key !== this.loadedRange) { this.rangeLoaded = false; this.cal.events = this.buildEvents(); }
+		const work = async () => {
 			const a = await fetcher.agenda(from, to);
-			this.meetings = a.meetings ?? [];
+			if (seq !== this.agendaSeq) return; // another period was asked meanwhile
+			const meetings = a.meetings ?? [];
+			let dispos: any[] = [];
 			if (this.role === "agent") {
+				let rooms: Room[];
+				[dispos, rooms] = await Promise.all([fetcher.disponibilities({ from, to }), fetcher.rooms()]);
+				if (seq !== this.agendaSeq) return;
 				this.contracts = a.contracts ?? []; this.assignations = a.assignations ?? []; this.suggestions = a.suggestions ?? [];
 				this.requests = (a.requests ?? []).map(normRequest); // used by the "Demandeurs" filter
 				this.intercoursePairs = a.intercoursePairs ?? [];
-				[this.dispos, this.rooms] = await Promise.all([fetcher.disponibilities({ from, to }), fetcher.rooms()]);
+				this.generators = a.generators ?? []; this.otherGenerators = a.consumerGenerators ?? [];
+				this.rooms = rooms;
 			} else {
 				this.agentsList = a.agents ?? []; this.requests = (a.requests ?? []).map(normRequest); this.slots = a.agentSlots ?? []; // the agent's hours, independent of my availabilities
+				this.generators = a.generators ?? []; this.otherGenerators = a.agentGenerators ?? [];
 				if (this.selAssign === null && this.agentsList.length) this.selAssign = this.assignId(this.agentsList[0]);
-				this.dispos = this.selAssign ? await fetcher.disponibilities({ assignationId: this.selAssign, from, to }) : [];
+				dispos = this.selAssign ? await fetcher.disponibilities({ assignationId: this.selAssign, from, to }) : [];
+				if (seq !== this.agendaSeq) return;
 			}
+			this.meetings = meetings;
+			this.dispos = dispos;
+			this.loadedRange = `${this.selAssign}|${from}|${to}`;
+			this.rangeLoaded = true;
 			this.cal.events = this.buildEvents();
-		});
+		};
+		if (!silent) return this.load(work);
+		try { await work(); } catch { /* a quiet reload never shows an error */ }
 	}
 
 	/** Agent of one of my assignations (consumer side). */
@@ -917,12 +1063,17 @@ export class DomHandler {
 	 */
 	private buildEvents(): CalEvent[] {
 		const span = (x: any) => ({ s: Date.parse(x.startAt), e: Date.parse(x.startAt) + x.durationMinutes * 60000 });
-		// Cancelled meetings are not drawn in the calendar: they are listed in their own section
-		const meetings = this.meetings.filter((m) => m.status !== "canceledBy");
+		this.buildVirtual();
+		const { from, to } = this.cal.range;
+		const inRange = (x: any) => { const { s, e } = span(x); return e > Date.parse(from) && s < Date.parse(to); };
+		// Cancelled meetings are not drawn in the calendar: they are listed in their own section.
+		// While the period loads, only what the generators give is drawn (the rows in memory belong to the previous period).
+		const meetings = this.meetings.filter((m) => m.status !== "canceledBy" && (this.rangeLoaded || inRange(m)));
 		this.cal.gaps = this.role === "agent" ? this.buildGaps(meetings) : [];
 		const busy = meetings.map(span).sort((a, b) => a.s - b.s);
 		const mk = (kind: EventKind, x: any, title: string, editable = false, status?: string, s = span(x).s, e = span(x).e): CalEvent => ({
-			id: `${kind}-${x.id}-${s}`, kind, title, status, editable, love: x.love, raw: x, start: new Date(s), end: new Date(e)
+			id: `${kind}-${x.id}-${s}`, kind, title, status, editable: editable && !x._pending && !x.virtual, love: x.love, raw: x,
+			start: new Date(s), end: new Date(e), virtual: !!x.virtual, pending: !!x._pending
 		});
 		const cut = (kind: EventKind, x: any, title: string, editable = false): CalEvent[] => {
 			const out: CalEvent[] = [];
@@ -937,22 +1088,297 @@ export class DomHandler {
 		};
 		const out: CalEvent[] = [];
 		const agent = this.role === "agent";
+		// Until the period is loaded, only the rows just created on screen (not saved yet) are drawn with the generators.
+		const rows = (list: any[]) => this.rangeLoaded ? list : list.filter((x) => x._pending);
 		for (const m of meetings) out.push(mk("meeting", m, agent ? this.who(m.assignationId) : this.agentOf(m.assignationId), false, m.status));
 		if (agent) {
 			for (const p of this.proposals) {
 				out.push({ id: p.id, kind: "proposal", title: this.who(p.assignationId), raw: p, start: p.start, end: p.end });
 			}
-			for (const s of this.suggestions) out.push(...cut("suggestion", s, "Mes horaires", true));
-			for (const d of this.dispos) if (this.isVisible(d.assignationId)) out.push(...cut("dispo", d, this.who(d.assignationId)));
+			for (const s of [...rows(this.suggestions), ...this.virtualSuggestions]) out.push(...cut("suggestion", s, "Mes horaires", true));
+			for (const d of [...rows(this.dispos), ...this.virtualDispos]) if (this.isVisible(d.assignationId)) out.push(...cut("dispo", d, this.who(d.assignationId)));
 		} else {
-			for (const s of this.slots) {
+			for (const s of [...rows(this.slots), ...this.virtualSuggestions]) {
 				const target = s.assignationId;
 				if (this.selAssign !== null && target !== undefined && target !== this.selAssign) continue;
 				out.push(...cut("slot", s, this.agentOf(target ?? this.selAssign)));
 			}
-			for (const d of this.dispos) out.push(...cut("dispo", d, "Ma disponibilité", true));
+			for (const d of [...rows(this.dispos), ...this.virtualDispos]) out.push(...cut("dispo", d, "Ma disponibilité", true));
 		}
 		return out;
+	}
+
+	// ---- Weekly repetitions ("générateurs") ------------------------------------------------------
+	/**
+	 * Occurrences of the generators in the visible period that are not real rows: the ones after the period the
+	 * server already generated (two weeks), or every one while the period is loading. Cancelled ones are skipped.
+	 */
+	private buildVirtual(): void {
+		const { from, to } = this.cal.range;
+		const now = Date.now();
+		const lo = Math.max(Date.parse(from), now);
+		const hi = Date.parse(to);
+		const rowsOf = (g: Generator) => (g.kind === "suggestion" ? (this.role === "agent" ? this.suggestions : this.slots) : this.dispos);
+		const make = (g: Generator, assignationId: number | null) => {
+			if (hi <= lo) return [];
+			const cancelled = new Set(g.cancellations);
+			const generated = Date.parse(g.generatedUntil);
+			const real = new Set(rowsOf(g).filter((r: any) => r.generatorId === g.id).map((r: any) => r.generatorOccurrence));
+			return occurrences(g, lo, hi)
+				.filter((o) => !cancelled.has(o.date) && !real.has(o.date) && (!this.rangeLoaded || o.start >= generated))
+				.map((o) => ({
+					id: `g${g.id}-${o.date}`, virtual: true, _pending: (g as any)._pending, generatorId: g.id, generatorOccurrence: o.date,
+					startAt: new Date(o.start).toISOString(), durationMinutes: g.durationMinutes, love: g.love,
+					contractId: g.contractId, assignationId, requestId: g.requestId ?? null
+				}));
+		};
+		if (this.role === "agent") {
+			this.virtualSuggestions = this.generators.flatMap((g) => make(g, null));
+			this.virtualDispos = this.otherGenerators.flatMap((g) => make(g, g.assignationId));
+		} else {
+			this.virtualDispos = this.generators.filter((g) => g.assignationId === this.selAssign).flatMap((g) => make(g, g.assignationId));
+			this.virtualSuggestions = this.otherGenerators.filter((g) => g.assignationId === this.selAssign).flatMap((g) => make(g, g.assignationId));
+		}
+	}
+
+	generatorOf(id: number | null | undefined): Generator | undefined {
+		return id == null ? undefined : [...this.generators, ...this.otherGenerators].find((g) => g.id === id);
+	}
+	describeGenerator(g: Generator | undefined): string { return g ? describe(g) : ""; }
+	weekdayLabel(n: number): string { return WEEKDAYS_FR[n] ?? ""; }
+	weekdays(): Array<{ value: number; label: string }> { return [1, 2, 3, 4, 5, 6, 0].map((value) => ({ value, label: WEEKDAYS_FR[value] })); }
+	/** My generators shown in the section: the consumer only sees those of the agent selected. */
+	myGenerators(): Generator[] {
+		return this.role === "consumer" ? this.generators.filter((g) => g.assignationId === this.selAssign) : this.generators;
+	}
+	/** Period of a generator, for the list ("depuis le …, jusqu'au …"). */
+	generatorPeriod(g: Generator): string {
+		const f = (d: string) => new Date(`${d}T12:00`).toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric" });
+		const tz = g.timeZone !== browserTimeZone() ? ` (heure de ${g.timeZone})` : "";
+		return `à partir du ${f(g.startsOn)}${g.endsOn ? `, jusqu’au ${f(g.endsOn)}` : ""}${tz}`;
+	}
+	/** Cancelled occurrences still to come (the past ones do not matter any more). */
+	futureCancellations(g: Generator): string[] {
+		const today = localDate(Date.now(), g.timeZone);
+		return g.cancellations.filter((d) => d >= today);
+	}
+	occurrenceLabel(date: string): string {
+		return new Date(`${date}T12:00`).toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "short" });
+	}
+
+	/** From the agenda: opens the habit in the "Habitudes" page. */
+	editGenerator(g: Generator) {
+		this.closePanel();
+		if (this.page.endsWith("-habits")) return this.openHabit(g);
+		this.habitToEdit = g.id;
+		this.go(this.role === "agent" ? "agent-habits" : "consumer-habits");
+	}
+
+	// ---- "Habitudes": the week template, one block per habit (generator) ----------------------------
+	async openHabits(): Promise<void> {
+		this.habitCal.onSelect = (s, e) => this.newHabit(s, e);
+		this.habitCal.selection = null;
+		this.habitCal.attach(() => { this.habitCal.events = this.buildHabitEvents(); });
+		await this.load(() => this.loadHabits());
+		const id = this.habitToEdit;
+		this.habitToEdit = null;
+		const g = this.generators.find((x) => x.id === id);
+		if (g) this.openHabit(g);
+	}
+
+	/** The habits come with the agenda; a one-minute period is enough (no row is needed here). */
+	private async loadHabits(): Promise<void> {
+		const now = new Date();
+		const a = await fetcher.agenda(now.toISOString(), new Date(now.getTime() + 60000).toISOString());
+		this.requests = (a.requests ?? []).map(normRequest);
+		this.generators = a.generators ?? [];
+		if (this.role === "agent") {
+			this.contracts = a.contracts ?? []; this.assignations = a.assignations ?? [];
+			this.otherGenerators = a.consumerGenerators ?? [];
+		} else {
+			this.agentsList = a.agents ?? [];
+			this.otherGenerators = a.agentGenerators ?? [];
+			if (this.selAssign === null && this.agentsList.length) this.selAssign = this.assignId(this.agentsList[0]);
+		}
+		this.habitCal.events = this.buildHabitEvents();
+	}
+
+	/**
+	 * One block per habit, on the column of its weekday. Mine can be edited; the other side's are shown for reference
+	 * (the agent sees his consumers' habits, filtered like in the agenda; the consumer sees his agent's hours).
+	 */
+	private buildHabitEvents(): CalEvent[] {
+		const days = this.habitCal.days;
+		const out: CalEvent[] = [];
+		const add = (g: Generator, kind: EventKind, title: string, editable: boolean) => {
+			for (const day of days.filter((d) => d.getDay() === g.weekday)) {
+				const start = new Date(day); start.setHours(0, g.startMinute, 0, 0);
+				const every = g.intervalWeeks > 1 ? ` · toutes les ${g.intervalWeeks} sem.` : "";
+				out.push({
+					id: `habit-${g.id}-${day.getDay()}`, kind, title: title + every, love: g.love, editable, raw: g,
+					start, end: new Date(start.getTime() + g.durationMinutes * 60000), pending: !!(g as any)._pending
+				});
+			}
+		};
+		if (this.role === "agent") {
+			for (const g of this.generators) add(g, "suggestion", "Mes horaires", true);
+			for (const g of this.otherGenerators) if (g.assignationId !== null && this.isVisible(g.assignationId)) add(g, "dispo", this.who(g.assignationId), false);
+		} else {
+			for (const g of this.myGenerators()) add(g, "dispo", "Ma disponibilité", true);
+			for (const g of this.otherGenerators) if (g.assignationId === this.selAssign) add(g, "slot", this.agentOf(g.assignationId as number), false);
+		}
+		return out;
+	}
+
+	/** A slot drawn on the week template: new habit on that weekday, at that time. */
+	newHabit(start: Date, end: Date) {
+		if (this.role === "consumer" && this.selAssign === null) { this.habitCal.selection = null; this.error = "Aucun agent ne vous est assigné."; return; }
+		if (this.role === "agent" && !this.contracts.length) { this.habitCal.selection = null; this.error = "Aucun contrat actif : demandez à votre administrateur."; return; }
+		this.error = "";
+		this.panel = {
+			type: "habit", error: "", gen: null,
+			form: { ...newGenForm(), weekday: start.getDay(), start: hhmm(start.getHours() * 60 + start.getMinutes()),
+				duration: Math.max(15, Math.round((end.getTime() - start.getTime()) / 60000)), contractId: this.contracts[0]?.id ?? null }
+		};
+	}
+
+	/** Keyboard / touch fallback: a new habit today at 9:00. */
+	openNewHabit() {
+		const s = new Date(); s.setHours(9, 0, 0, 0);
+		this.newHabit(s, new Date(s.getTime() + 2 * 3600000));
+	}
+
+	openHabitEvent(ev: CalEvent) {
+		if (ev.pending) { this.error = "Enregistrement en cours… réessayez dans un instant."; return; }
+		if (!ev.editable) { // the other side's habit: only informative
+			this.panel = { type: "habit-info", ev, error: "" };
+			return;
+		}
+		this.openHabit(ev.raw);
+	}
+
+	openHabit(g: Generator) {
+		this.error = "";
+		this.panel = {
+			type: "habit", error: "", gen: g,
+			form: { id: g.id, weekday: g.weekday, start: hhmm(g.startMinute), duration: g.durationMinutes, love: g.love ?? 0.5,
+				intervalWeeks: g.intervalWeeks, startsOn: g.startsOn, endsOn: g.endsOn ?? "", contractId: g.contractId }
+		};
+	}
+
+	async submitHabit() {
+		const form = this.panel.form;
+		let ok = false;
+		this.check(() => { this.generatorBody(form); ok = true; });
+		if (!ok) return;
+		this.closePanel();
+		await this.saveGenerator(form);
+	}
+
+	private generatorBody(f: ReturnType<typeof newGenForm>): GeneratorBody {
+		const [h, m] = String(f.start).split(":").map(Number);
+		const duration = Number(f.duration), love = Number(f.love), interval = Number(f.intervalWeeks);
+		if (!Number.isInteger(h) || !Number.isInteger(m)) throw new Error("L’heure de début est invalide.");
+		if (!Number.isInteger(duration) || duration <= 0 || duration > 1440) throw new Error("La durée est un nombre entier de minutes, 24 h au plus.");
+		if (!(love >= 0 && love <= 1)) throw new Error("La préférence doit être comprise entre 0 et 1.");
+		if (!Number.isInteger(interval) || interval < 1 || interval > 52) throw new Error("La fréquence est comprise entre 1 et 52 semaines.");
+		if (!f.startsOn) throw new Error("Indiquez la date de début.");
+		if (f.endsOn && f.endsOn < f.startsOn) throw new Error("La date de fin doit être après la date de début.");
+		const body: GeneratorBody = {
+			weekday: Number(f.weekday), startMinute: h * 60 + m, durationMinutes: duration, love, intervalWeeks: interval,
+			timeZone: browserTimeZone(), startsOn: f.startsOn, endsOn: f.endsOn || null
+		};
+		if (this.role === "agent") {
+			const contractId = Number(f.contractId ?? this.contracts[0]?.id);
+			if (!contractId) throw new Error("Aucun contrat actif : demandez à votre administrateur.");
+			body.contractId = contractId;
+		} else {
+			if (this.selAssign === null) throw new Error("Aucun agent ne vous est assigné.");
+			body.assignationId = this.selAssign;
+			const request = this.currentRequest();
+			if (request) body.requestId = request.id;
+		}
+		return body;
+	}
+
+	/** Rows generated by a generator that are still to come (removed by the server when the rule changes). */
+	private dropFutureRows(id: number): () => void {
+		const now = Date.now();
+		const keep = (r: any) => r.generatorId !== id || Date.parse(r.startAt) <= now;
+		const before = { dispos: this.dispos, suggestions: this.suggestions };
+		this.dispos = this.dispos.filter(keep); this.suggestions = this.suggestions.filter(keep);
+		return () => { this.dispos = before.dispos; this.suggestions = before.suggestions; };
+	}
+
+	/** Creates or changes a habit (generator), from the "Habitudes" page or the "repeat" box of the agenda. */
+	async saveGenerator(form: ReturnType<typeof newGenForm>) {
+		let body!: GeneratorBody;
+		if (!this.check(() => { body = this.generatorBody(form); })) return;
+		const id = form.id;
+		const local = (base: Partial<Generator> = {}): Generator => ({
+			...base, id: id ?? tempId(), kind: this.role === "agent" ? "suggestion" : "disponibility",
+			contractId: body.contractId ?? null, assignationId: body.assignationId ?? null, requestId: body.requestId ?? null,
+			weekday: body.weekday, startMinute: body.startMinute, durationMinutes: body.durationMinutes, love: body.love,
+			intervalWeeks: body.intervalWeeks, timeZone: body.timeZone, startsOn: body.startsOn, endsOn: body.endsOn,
+			// Everything is drawn from the rule until the server has generated the rows again.
+			generatedUntil: new Date().toISOString(), cancellations: base.cancellations ?? [], _pending: true
+		} as Generator);
+		if (id === null) {
+			const tmp = local();
+			await this.optimistic(() => {
+				this.generators = [...this.generators, tmp];
+				return () => { this.generators = this.generators.filter((g) => g.id !== tmp.id); };
+			}, async () => {
+				const saved = await fetcher.createGenerator(body);
+				this.generators = this.generators.map((g) => g.id === tmp.id ? { ...saved, generatedUntil: tmp.generatedUntil } : g);
+			}, "Habitude enregistrée : le créneau apparaît chaque semaine dans l’agenda.");
+			return;
+		}
+		const before = this.generators.find((g) => g.id === id);
+		await this.optimistic(() => {
+			this.generators = this.generators.map((g) => g.id === id ? local(g) : g);
+			const restoreRows = this.dropFutureRows(id);
+			return () => { restoreRows(); if (before) this.generators = this.generators.map((g) => g.id === id ? before : g); };
+		}, async () => {
+			const saved = await fetcher.updateGenerator(id, body);
+			this.generators = this.generators.map((g) => g.id === id ? { ...saved, generatedUntil: new Date().toISOString() } : g);
+		}, "Habitude modifiée.");
+	}
+
+	async deleteGenerator(g: Generator) {
+		if (!confirm(`Supprimer l’habitude « ${describe(g)} » ? Les créneaux à venir qu’elle a créés seront supprimés.`)) return;
+		const id = g.id;
+		this.closePanel();
+		const before = this.generators;
+		await this.optimistic(() => {
+			this.generators = this.generators.filter((x) => x.id !== id);
+			const restoreRows = this.dropFutureRows(id);
+			return () => { restoreRows(); this.generators = before; };
+		}, async () => { await fetcher.deleteGenerator(id); }, "Habitude supprimée.");
+	}
+
+	/** Changes the cancellations of a generator on screen; returns how to undo it. */
+	private setCancellations(id: number, change: (dates: string[]) => string[]): () => void {
+		const before = this.generators.find((g) => g.id === id);
+		this.generators = this.generators.map((g) => g.id === id ? { ...g, cancellations: change(g.cancellations) } : g);
+		return () => { if (before) this.generators = this.generators.map((g) => g.id === id ? before : g); };
+	}
+
+	/** "Cancelator": this occurrence of the repetition will not happen (removed if it was already created). */
+	async cancelOccurrence(generatorId: number, date: string) {
+		this.closePanel();
+		await this.optimistic(() => {
+			const undo = this.setCancellations(generatorId, (d) => [...new Set([...d, date])]);
+			const keep = (r: any) => !(r.generatorId === generatorId && r.generatorOccurrence === date);
+			const before = { dispos: this.dispos, suggestions: this.suggestions };
+			this.dispos = this.dispos.filter(keep); this.suggestions = this.suggestions.filter(keep);
+			return () => { undo(); this.dispos = before.dispos; this.suggestions = before.suggestions; };
+		}, async () => { await fetcher.cancelOccurrence(generatorId, date); }, "Occurrence annulée.");
+	}
+
+	async restoreOccurrence(generatorId: number, date: string) {
+		await this.optimistic(() => this.setCancellations(generatorId, (d) => d.filter((x) => x !== date)),
+			async () => { await fetcher.restoreOccurrence(generatorId, date); }, "Occurrence rétablie.");
 	}
 
 
@@ -1027,8 +1453,9 @@ export class DomHandler {
 		}
 		this.proposals = plan({
 			from: Date.parse(from), to: Date.parse(to), now: Date.now(), maxMinutes,
-			dispos: this.dispos.filter((d) => this.isVisible(d.assignationId)),
-			suggestions: this.suggestions, contracts: this.contracts, assignations: this.assignations, remaining,
+			// Occurrences of the repetitions count too: booking one generates it on the server.
+			dispos: [...this.dispos, ...this.virtualDispos].filter((d) => this.isVisible(d.assignationId)),
+			suggestions: [...this.suggestions, ...this.virtualSuggestions], contracts: this.contracts, assignations: this.assignations, remaining,
 			meetings: this.meetings.filter((m) => m.status !== "canceledBy"),
 			gap: (a, b) => this.gap(a, b)
 		});
@@ -1048,13 +1475,27 @@ export class DomHandler {
 		this.proposals = this.proposals.filter((x) => x.id !== p.id);
 	}
 
+	/** The proposal becomes a meeting on screen at once; it comes back if the server refuses it. */
 	async validateProposal() {
 		const p: Proposal = this.panel.ev.raw;
-		await this.run(async () => {
-			await this.bookProposal(p);
-			this.closePanel();
-			await this.refreshAgenda();
+		this.closePanel();
+		const tmp = this.tempMeeting(p.assignationId, p.start, Math.round((p.end.getTime() - p.start.getTime()) / 60000));
+		await this.optimistic(() => {
+			this.proposals = this.proposals.filter((x) => x.id !== p.id);
+			this.meetings = [...this.meetings, tmp];
+			return () => { this.meetings = this.meetings.filter((m) => m.id !== tmp.id); this.proposals = [...this.proposals, p]; };
+		}, async () => {
+			const r = await fetcher.createMeeting({
+				assignationId: p.assignationId, startAt: p.start.toISOString(), durationMinutes: tmp.durationMinutes,
+				roomName: null, comment: "", idempotencyKey: `${p.id}-${uid()}`
+			});
+			this.meetings = this.meetings.map((m) => m.id === tmp.id ? r.meeting : m);
 		}, "Rendez-vous créé.");
+	}
+
+	/** Meeting drawn before the server created it. */
+	private tempMeeting(assignationId: number, start: Date, durationMinutes: number, roomName: string | null = null, comment = ""): Meeting {
+		return { id: tempId(), assignationId, startAt: start.toISOString(), durationMinutes, status: "pending", roomName, comment, _pending: true } as Meeting;
 	}
 
 	eraseProposal() {
@@ -1097,12 +1538,25 @@ export class DomHandler {
 		const minutes = this.cal.settings.startHour * 60 + Math.floor(((e.clientY - rect.top) / rect.height) * this.cal.hours.length * 60 / 15) * 15;
 		const start = new Date(day); start.setHours(0, minutes, 0, 0);
 		if (start.getTime() <= Date.now()) { this.error = "Impossible de déplacer un créneau dans le passé."; return; }
-		await this.run(async () => {
-			const body = { startAt: start.toISOString(), durationMinutes: data.duration, love: data.love ?? 0.5 };
-			if (data.kind === "dispo") await fetcher.updateDispo(data.id, body);
-			else await fetcher.updateSuggestion(data.id, body);
-			await this.refreshAgenda();
-		}, "Créneau déplacé.");
+		const body = { startAt: start.toISOString(), durationMinutes: data.duration, love: data.love ?? 0.5 };
+		await this.saveRow(data.kind === "dispo" ? "dispos" : "suggestions", data.id, body, "Créneau déplacé.");
+	}
+
+	/**
+	 * Moves / changes one of my intervals on screen at once, then on the server. A generated occurrence changed by
+	 * hand leaves its repetition (the server cancels it there), the screen does the same.
+	 */
+	private async saveRow(list: "dispos" | "suggestions", id: number, body: { startAt: string; durationMinutes: number; love: number }, ok: string) {
+		const before = this[list].find((x: any) => x.id === id);
+		if (!before) return;
+		await this.optimistic(() => {
+			const undoCancel = before.generatorId ? this.setCancellations(before.generatorId, (d) => [...new Set([...d, before.generatorOccurrence])]) : null;
+			this[list] = this[list].map((x: any) => x.id === id ? { ...x, ...body, generatorId: null, generatorOccurrence: null, _pending: true } : x);
+			return () => { undoCancel?.(); this[list] = this[list].map((x: any) => x.id === id ? before : x); };
+		}, async () => {
+			const saved = list === "dispos" ? await fetcher.updateDispo(id, body) : await fetcher.updateSuggestion(id, body);
+			this[list] = this[list].map((x: any) => x.id === id ? saved : x);
+		}, ok);
 	}
 
 	dragCalendarEvent(e: DragEvent, ev: CalEvent) {
@@ -1116,6 +1570,7 @@ export class DomHandler {
 	async selectAgent(value: string) {
 		this.selAssign = Number(value);
 		this.closePanel();
+		if (this.page === "consumer-habits") { this.habitCal.events = this.buildHabitEvents(); return; }
 		await this.refreshAgenda();
 	}
 
@@ -1148,7 +1603,7 @@ export class DomHandler {
 		}, unlimited ? "La limite d’heures est retirée." : "Nombre d’heures mis à jour.");
 	}
 
-	closePanel() { this.panel = null; this.cal.selection = null; }
+	closePanel() { this.panel = null; this.cal.selection = null; this.habitCal.selection = null; }
 
 	/** Fallback for keyboard and touch users who do not want to pick a slot in the grid. */
 	openCreate() {
@@ -1170,19 +1625,25 @@ export class DomHandler {
 		this.error = "";
 		this.panel = {
 			type: "interval", error: "",
-			form: { id: null, start: toLocalInput(start), duration: Math.round((end.getTime() - start.getTime()) / 60000), love: 0.5, contractId: this.contracts[0]?.id }
+			form: { id: null, start: toLocalInput(start), duration: Math.round((end.getTime() - start.getTime()) / 60000), love: 0.5, contractId: this.contracts[0]?.id, repeat: false, intervalWeeks: 1 }
 		};
 	}
 
 	openEvent(ev: CalEvent) {
 		this.error = "";
+		if (ev.pending) { this.error = "Enregistrement en cours… réessayez dans un instant."; return; }
 		if (ev.kind === "meeting") return this.openMeeting(ev.raw);
 		if (ev.kind === "slot") { this.panel = { type: "slot", ev, error: "" }; return; }
 		if (ev.kind === "proposal") { this.panel = { type: "proposal", ev, error: "" }; return; }
 		if (ev.kind === "dispo" && this.role === "agent") return void this.openBook(ev);
+		if (ev.virtual) { // an occurrence of one of my repetitions that is not generated yet
+			this.panel = { type: "occurrence", ev, gen: this.generatorOf(ev.raw.generatorId), error: "" };
+			return;
+		}
 		this.panel = { // editing one of my own intervals
 			type: "interval", error: "",
-			form: { id: ev.raw.id, start: toLocalInput(new Date(ev.raw.startAt)), duration: ev.raw.durationMinutes, love: ev.raw.love ?? 0.5, contractId: ev.raw.contractId }
+			form: { id: ev.raw.id, start: toLocalInput(new Date(ev.raw.startAt)), duration: ev.raw.durationMinutes, love: ev.raw.love ?? 0.5, contractId: ev.raw.contractId,
+				generatorId: ev.raw.generatorId ?? null, occurrence: ev.raw.generatorOccurrence ?? null }
 		};
 	}
 
@@ -1192,34 +1653,60 @@ export class DomHandler {
 		this.beginInterval(ev.start, ev.end);
 	}
 
+	/** Saves the slot of the panel: shown at once, sent in the background. "Répéter" creates a weekly repetition instead. */
 	async submitInterval() {
-		await this.run(async () => {
-			const f = this.panel.form;
-			const start = new Date(f.start);
-			const duration = Number(f.duration);
-			const love = Number(f.love);
+		const f = this.panel.form;
+		const start = new Date(f.start);
+		const duration = Number(f.duration);
+		const love = Number(f.love);
+		if (!this.check(() => {
 			if (Number.isNaN(start.getTime())) throw new Error("La date de début est invalide.");
 			if (!Number.isInteger(duration) || duration <= 0) throw new Error("La durée doit être un nombre entier de minutes.");
 			if (!(love >= 0 && love <= 1)) throw new Error("La préférence doit être comprise entre 0 et 1.");
 			if (start.getTime() + duration * 60000 <= Date.now()) throw new Error("Ce créneau est déjà passé.");
-			const body = { startAt: start.toISOString(), durationMinutes: duration, love };
-			if (this.role === "consumer") {
-				if (f.id) await fetcher.updateDispo(f.id, body);
-				else await fetcher.createDispo({ assignationId: this.selAssign as number, requestId: this.currentRequest()?.id, ...body });
-			} else if (f.id) await fetcher.updateSuggestion(f.id, body);
-			else await fetcher.createSuggestion({ contractId: Number(f.contractId), ...body });
+			if (f.repeat && duration > 1440) throw new Error("Un créneau répété dure 24 h au plus.");
+		})) return;
+		const body = { startAt: start.toISOString(), durationMinutes: duration, love };
+		const list = this.role === "consumer" ? "dispos" : "suggestions";
+		if (!f.id && f.repeat) {
+			const tz = browserTimeZone();
+			const form = { ...newGenForm(), weekday: start.getDay(), start: hhmm(start.getHours() * 60 + start.getMinutes()), duration, love,
+				intervalWeeks: Number(f.intervalWeeks) || 1, startsOn: localDate(start.getTime(), tz), contractId: Number(f.contractId) || null };
+			let ok = false;
+			this.check(() => { this.generatorBody(form); ok = true; });
+			if (!ok) return;
 			this.closePanel();
-			await this.refreshAgenda();
+			return this.saveGenerator(form);
+		}
+		this.closePanel();
+		if (f.id) return this.saveRow(list, f.id, body, "Créneau enregistré.");
+		const tmp: any = this.role === "consumer"
+			? { id: tempId(), assignationId: this.selAssign, requestId: this.currentRequest()?.id, ...body, _pending: true }
+			: { id: tempId(), contractId: Number(f.contractId), ...body, _pending: true };
+		await this.optimistic(() => {
+			this[list] = [...this[list], tmp];
+			return () => { this[list] = this[list].filter((x: any) => x.id !== tmp.id); };
+		}, async () => {
+			const saved = this.role === "consumer"
+				? await fetcher.createDispo({ assignationId: tmp.assignationId, requestId: tmp.requestId, ...body })
+				: await fetcher.createSuggestion({ contractId: tmp.contractId, ...body });
+			this[list] = this[list].map((x: any) => x.id === tmp.id ? saved : x);
 		}, "Créneau enregistré.");
 	}
 
 	async deleteInterval() {
-		if (!confirm("Supprimer ce créneau ?")) return;
-		await this.run(async () => {
-			const id = this.panel.form.id;
-			if (this.role === "consumer") await fetcher.deleteDispo(id); else await fetcher.deleteSuggestion(id);
-			this.closePanel();
-			await this.refreshAgenda();
+		const f = this.panel.form;
+		if (!confirm(f.generatorId ? "Supprimer cette occurrence ? La répétition continue les autres semaines." : "Supprimer ce créneau ?")) return;
+		const id = f.id, list = this.role === "consumer" ? "dispos" : "suggestions";
+		const row = this[list].find((x: any) => x.id === id);
+		this.closePanel();
+		await this.optimistic(() => {
+			// A generated occurrence is cancelled in its repetition (the server does the same).
+			const undoCancel = row?.generatorId ? this.setCancellations(row.generatorId, (d) => [...new Set([...d, row.generatorOccurrence])]) : null;
+			this[list] = this[list].filter((x: any) => x.id !== id);
+			return () => { undoCancel?.(); if (row) this[list] = [...this[list], row]; };
+		}, async () => {
+			if (list === "dispos") await fetcher.deleteDispo(id); else await fetcher.deleteSuggestion(id);
 		}, "Créneau supprimé.");
 	}
 
@@ -1249,17 +1736,19 @@ export class DomHandler {
 		if (p.form.roomName && p.rooms.some((r: Room) => r.name === p.form.roomName && r.available === false)) p.form.roomName = "";
 	}
 
+	/** The meeting is drawn at once (checked here like the server does), and removed again if the server refuses it. */
 	async submitBook() {
-		await this.run(async () => {
-			const p = this.panel;
-			const f = p.form;
-			const start = new Date(f.start);
-			const duration = Number(f.duration);
+		const p = this.panel;
+		const f = p.form;
+		const start = new Date(f.start);
+		const duration = Number(f.duration);
+		if (!this.check(() => {
 			if (Number.isNaN(start.getTime()) || !Number.isInteger(duration) || duration <= 0) throw new Error("Date ou durée invalide.");
+			if (start.getTime() <= Date.now()) throw new Error("Un rendez-vous doit commencer dans le futur.");
 			const ev: CalEvent = p.ev;
 			const end = start.getTime() + duration * 60000;
-			// Treat adjacent availability rows for the same request as one continuous window.
-			const related = this.dispos
+			// Treat adjacent availability rows for the same request as one continuous window (repetitions included).
+			const related = [...this.dispos, ...this.virtualDispos]
 				.filter((d: any) => d.assignationId === f.assignationId && d.requestId === ev.raw.requestId)
 				.map((d: any) => ({ start: Date.parse(d.startAt), end: Date.parse(d.startAt) + d.durationMinutes * 60000 }))
 				.sort((a, b) => a.start - b.start);
@@ -1274,12 +1763,22 @@ export class DomHandler {
 				const windowEnd = related.find((interval) => interval.start <= start.getTime() && interval.end >= start.getTime())?.end ?? ev.end.getTime();
 				throw new Error(`Le rendez-vous doit rester dans une disponibilité continue à partir de ${this.cal.time(new Date(start.getTime()))} (disponible jusqu’à ${this.cal.time(new Date(windowEnd))}).`);
 			}
-			await fetcher.createMeeting({
+			const s = start.getTime();
+			if (this.meetings.some((m) => m.status !== "canceledBy" && Date.parse(m.startAt) < end && Date.parse(m.startAt) + m.durationMinutes * 60000 > s)) {
+				throw new Error("Vous avez déjà un rendez-vous sur ce créneau.");
+			}
+		})) return;
+		this.closePanel();
+		const tmp = this.tempMeeting(f.assignationId, start, duration, f.roomName || null, f.comment ?? "");
+		await this.optimistic(() => {
+			this.meetings = [...this.meetings, tmp];
+			return () => { this.meetings = this.meetings.filter((m) => m.id !== tmp.id); };
+		}, async () => {
+			const r = await fetcher.createMeeting({
 				assignationId: f.assignationId, startAt: start.toISOString(), durationMinutes: duration,
 				roomName: f.roomName || null, comment: f.comment ?? "", idempotencyKey: p.key
 			});
-			this.closePanel();
-			await this.refreshAgenda();
+			this.meetings = this.meetings.map((m) => m.id === tmp.id ? r.meeting : m);
 		}, "Rendez-vous créé.");
 	}
 
@@ -1287,37 +1786,54 @@ export class DomHandler {
 	openMeeting(m: Meeting) {
 		this.panel = {
 			type: "meeting", m, error: "",
-			form: { comment: m.comment ?? "", roomName: m.roomName ?? m.room ?? "" }
+			form: { comment: m.comment ?? "", roomName: m.roomName ?? m.room ?? "", actual: m.durationMinutes }
 		};
 	}
 
-	canEditMeeting(m: Meeting): boolean { return this.role === "agent" && m.status === "pending"; }
-	canCancelMeeting(m: Meeting): boolean { return m.status === "pending"; }
-
-	async saveMeeting() {
-		await this.run(async () => {
-			const p = this.panel;
-			await fetcher.patchMeeting(p.m.id, { comment: p.form.comment, roomName: p.form.roomName || null });
-			this.closePanel();
-			await this.refreshAgenda();
-		}, "Rendez-vous mis à jour.");
+	/** "60 min" or, for a meeting validated with another duration, "60 min prévues · 45 min effectuées". */
+	durationLabel(m: Meeting): string {
+		const a = m.actualDurationMinutes;
+		return a != null && a !== m.durationMinutes ? `${m.durationMinutes} min prévues · ${a} min effectuées` : `${a ?? m.durationMinutes} min`;
 	}
 
+	canEditMeeting(m: Meeting): boolean { return this.role === "agent" && m.status === "pending" && m.id > 0; }
+	canCancelMeeting(m: Meeting): boolean { return m.status === "pending" && m.id > 0; }
+
+	/** Changes one meeting of the agenda on screen; returns how to undo it. */
+	private patchMeetingLocal(id: number, change: Partial<Meeting>): () => void {
+		const before = this.meetings.find((m) => m.id === id);
+		this.meetings = this.meetings.map((m) => m.id === id ? { ...m, ...change } : m);
+		return () => { if (before) this.meetings = this.meetings.map((m) => m.id === id ? before : m); };
+	}
+
+	async saveMeeting() {
+		const p = this.panel;
+		const id = p.m.id, change = { comment: p.form.comment, roomName: p.form.roomName || null };
+		this.closePanel();
+		await this.optimistic(() => this.patchMeetingLocal(id, change), async () => { await fetcher.patchMeeting(id, change); }, "Rendez-vous mis à jour.");
+	}
+
+	/** Validates the meeting with the duration really spent (the booked one by default). */
 	async markDone() {
-		await this.run(async () => {
-			await fetcher.patchMeeting(this.panel.m.id, { status: "done" });
-			this.closePanel();
-			await this.refreshAgenda();
+		const p = this.panel;
+		const minutes = Number(p.form.actual);
+		if (!this.check(() => { if (!Number.isInteger(minutes) || minutes <= 0) throw new Error("La durée réelle est un nombre entier de minutes, supérieur à 0."); })) return;
+		const id = p.m.id, actual = minutes === p.m.durationMinutes ? null : minutes;
+		// The comment and room typed in the panel are kept too.
+		const change = { comment: p.form.comment, roomName: p.form.roomName || null };
+		const changed = change.comment !== (p.m.comment ?? "") || change.roomName !== (p.m.roomName ?? null);
+		this.closePanel();
+		await this.optimistic(() => this.patchMeetingLocal(id, { ...change, status: "done", actualDurationMinutes: actual }), async () => {
+			if (changed) await fetcher.patchMeeting(id, change);
+			await fetcher.patchMeeting(id, { status: "done", actualDurationMinutes: actual });
 		}, "Rendez-vous marqué comme terminé.");
 	}
 
 	async cancelMeeting() {
 		if (!confirm("Annuler ce rendez-vous ?")) return;
-		await this.run(async () => {
-			await fetcher.cancelMeeting(this.panel.m.id);
-			this.closePanel();
-			await this.refreshAgenda();
-		}, "Rendez-vous annulé.");
+		const id = this.panel.m.id;
+		this.closePanel();
+		await this.optimistic(() => this.patchMeetingLocal(id, { status: "canceledBy" }), async () => { await fetcher.cancelMeeting(id); }, "Rendez-vous annulé.");
 	}
 }
 

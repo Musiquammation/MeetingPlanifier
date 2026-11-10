@@ -21,7 +21,10 @@ export interface ResultRow {
 	agent: string;
 	consumer: string;
 	start: string;
+	/** Duration counted: the actual one once validated with one, else the booked one. */
 	minutes: number;
+	/** Booked duration (differs from minutes when the meeting was validated with another duration). */
+	plannedMinutes: number;
 	hours: number;
 	status: Meeting["status"];
 	state: MeetingState;
@@ -184,7 +187,8 @@ export class ResultsView {
 
 	// ---- Rows and months -----------------------------------------------------------------
 	private row(m: Meeting, a: any, now: Date): ResultRow {
-		const hours = m.durationMinutes / 60;
+		const minutes = m.actualDurationMinutes ?? m.durationMinutes;
+		const hours = minutes / 60;
 		let rate: number, paid = 0, society = 0, share: number;
 		if (this.isAdmin) {
 			const price = (m.hourlyRate ?? 0) * hours;
@@ -199,7 +203,7 @@ export class ResultsView {
 		}
 		return {
 			id: m.id, agent: person(a.agent) || "Agent", consumer: person(a.consumer) || "Consommateur",
-			start: m.startAt, minutes: m.durationMinutes, hours, status: m.status, state: meetingState(m, now),
+			start: m.startAt, minutes, plannedMinutes: m.durationMinutes, hours, status: m.status, state: meetingState(m, now),
 			rate, paid, society, share, comment: m.comment ?? ""
 		};
 	}
