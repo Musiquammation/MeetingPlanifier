@@ -1551,7 +1551,6 @@ export class DomHandler {
 		const rect = col.getBoundingClientRect();
 		const minutes = this.cal.settings.startHour * 60 + Math.floor(((e.clientY - rect.top) / rect.height) * this.cal.hours.length * 60 / 15) * 15;
 		const start = new Date(day); start.setHours(0, minutes, 0, 0);
-		if (start.getTime() <= Date.now()) { this.error = "Impossible de déplacer un créneau dans le passé."; return; }
 		const body = { startAt: start.toISOString(), durationMinutes: data.duration, love: data.love ?? 0.5 };
 		await this.saveRow(data.kind === "dispo" ? "dispos" : "suggestions", data.id, body, "Créneau déplacé.");
 	}
@@ -1628,7 +1627,6 @@ export class DomHandler {
 
 	/** A slot was drawn: the agent books a meeting when the gesture started on an availability, else adds his hours. */
 	beginInterval(start: Date, end: Date, origin: CalEvent | null = null) {
-		if (end.getTime() <= Date.now()) { this.cal.selection = null; this.error = "Ce créneau est déjà passé."; return; }
 		if (this.role === "agent" && origin?.kind === "dispo") { this.error = ""; void this.openBook(origin, start, end); return; }
 		if (this.role === "consumer" && this.selAssign === null) {
 			this.cal.selection = null;
@@ -1677,7 +1675,6 @@ export class DomHandler {
 			if (Number.isNaN(start.getTime())) throw new Error("La date de début est invalide.");
 			if (!Number.isInteger(duration) || duration <= 0) throw new Error("La durée doit être un nombre entier de minutes.");
 			if (!(love >= 0 && love <= 1)) throw new Error("La préférence doit être comprise entre 0 et 1.");
-			if (start.getTime() + duration * 60000 <= Date.now()) throw new Error("Ce créneau est déjà passé.");
 			if (f.repeat && duration > 1440) throw new Error("Un créneau répété dure 24 h au plus.");
 		})) return;
 		const body = { startAt: start.toISOString(), durationMinutes: duration, love };
@@ -1758,7 +1755,6 @@ export class DomHandler {
 		const duration = Number(f.duration);
 		if (!this.check(() => {
 			if (Number.isNaN(start.getTime()) || !Number.isInteger(duration) || duration <= 0) throw new Error("Date ou durée invalide.");
-			if (start.getTime() <= Date.now()) throw new Error("Un rendez-vous doit commencer dans le futur.");
 			const ev: CalEvent = p.ev;
 			const end = start.getTime() + duration * 60000;
 			// Treat adjacent availability rows for the same request as one continuous window (repetitions included).

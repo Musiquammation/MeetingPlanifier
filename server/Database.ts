@@ -1981,7 +1981,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   }
 
   listDisponibilitiesForRequest(requestId: number): Disponibility[] {
-  this.cleanExpiredIntervals();
   const rows = this.connection.prepare(
     `SELECT id, assignation_id, request_id, start_at, duration_minutes, love, generator_id, generator_occurrence, created_at, updated_at
      FROM disponibilities WHERE request_id = ? ORDER BY start_at`,
@@ -1990,7 +1989,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   }
 
   listDisponibilitiesForAssignation(assignationId: number, from?: string | Date, to?: string | Date): Disponibility[] {
-  this.cleanExpiredIntervals();
   const start = from === undefined ? null : this.normalizeIsoDate(from, "Range start");
   const end = to === undefined ? null : this.normalizeIsoDate(to, "Range end");
   if (start && end && Date.parse(start) >= Date.parse(end)) throw new Error("Range end must be after range start");
@@ -2056,7 +2054,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   }
 
   listSuggestionsForContract(contractId: number, from?: string | Date, to?: string | Date): Suggestion[] {
-  this.cleanExpiredIntervals();
   const start = from === undefined ? null : this.normalizeIsoDate(from, "Range start");
   const end = to === undefined ? null : this.normalizeIsoDate(to, "Range end");
   if (start && end && Date.parse(start) >= Date.parse(end)) throw new Error("Range end must be after range start");
@@ -2410,7 +2407,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   // ---------------------------------------------------------------------------
 
   listCompatibleSlotsForConsumer(consumerId: number, from: string | Date, to: string | Date): CompatibleSlot[] {
-  this.cleanExpiredIntervals();
   const rangeStart = this.normalizeIsoDate(from, "Range start");
   const rangeEnd = this.normalizeIsoDate(to, "Range end");
   if (Date.parse(rangeStart) >= Date.parse(rangeEnd)) throw new Error("Range end must be after range start");
@@ -2460,7 +2456,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
    * that overlaps: the agent's hours are always returned.
    */
   listAgentSuggestionsForConsumer(consumerId: number, from: string | Date, to: string | Date): Array<Suggestion & { assignationId: number }> {
-  this.cleanExpiredIntervals();
   const rangeStart = this.normalizeIsoDate(from, "Range start");
   const rangeEnd = this.normalizeIsoDate(to, "Range end");
   if (Date.parse(rangeStart) >= Date.parse(rangeEnd)) throw new Error("Range end must be after range start");
@@ -2508,7 +2503,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   disponibilities: Disponibility[];
   suggestions: Suggestion[];
   } {
-  this.cleanExpiredIntervals();
   const rangeStart = this.normalizeIsoDate(from, "Range start");
   const rangeEnd = this.normalizeIsoDate(to, "Range end");
   if (Date.parse(rangeStart) >= Date.parse(rangeEnd)) throw new Error("Range end must be after range start");
@@ -2548,7 +2542,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   suggestions: Suggestion[];
   disponibilities: Disponibility[];
   } {
-  this.cleanExpiredIntervals();
   const rangeStart = this.normalizeIsoDate(from, "Range start");
   const rangeEnd = this.normalizeIsoDate(to, "Range end");
   if (Date.parse(rangeStart) >= Date.parse(rangeEnd)) throw new Error("Range end must be after range start");
@@ -2591,8 +2584,6 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   const idempotencyKey = input.idempotencyKey?.trim() || null;
   const comment = input.comment ?? "";
   if (comment.length > 4000) throw new Error("Meeting comment cannot exceed 4000 characters");
-  if (Date.parse(startAt) <= Date.parse(now)) throw new Error("A meeting must start in the future");
-  this.cleanExpiredIntervals(now);
 
   return this.withTransaction(() => {
     if (idempotencyKey) {

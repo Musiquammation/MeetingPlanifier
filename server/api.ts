@@ -435,7 +435,6 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  const from = requiredString(req.query.from, "from", 40);
 	  const to = requiredString(req.query.to, "to", 40);
 	  if (!Number.isFinite(Date.parse(from)) || !Number.isFinite(Date.parse(to)) || Date.parse(from) >= Date.parse(to)) return fail(res, 400, "Plage de dates invalide.");
-	  database.cleanExpiredIntervals?.();
 	  database.materializeGenerators();
 	  const s = session(req);
 	  if (s.role === "consumer") {

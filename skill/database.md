@@ -98,7 +98,7 @@ Pour ajouter une migration : augmenter `VERSION_NUMBER`, écrire `migrations/mig
 - **`setAvailabilityRequestStatus(id: number, status: AvailabilityRequestStatus): AvailabilityRequest`** — Modifie le statut d’une demande de disponibilité.
 - **`createDisponibility(input: CreateDisponibilityInput): Disponibility`** — Ajoute un créneau de disponibilité d’un consommateur.
 - **`getDisponibilityById(id: number): Disponibility | null`** — Recherche un créneau de disponibilité par identifiant.
-- **`listDisponibilitiesForRequest(requestId: number): Disponibility[]`** — Liste les disponibilités associées à une demande, après nettoyage des créneaux expirés.
+- **`listDisponibilitiesForRequest(requestId: number): Disponibility[]`** — Liste les disponibilités associées à une demande.
 - **`listDisponibilitiesForAssignation(assignationId: number, from?: string | Date, to?: string | Date): Disponibility[]`** — Liste les disponibilités d’une assignation qui chevauchent éventuellement une plage.
 - **`updateDisponibility(id: number, input: { startAt: string | Date; durationMinutes: number; love: number }): Disponibility`** — Modifie un créneau de disponibilité.
 - **`deleteDisponibility(id: number): void`** — Supprime un créneau de disponibilité.
@@ -107,7 +107,7 @@ Pour ajouter une migration : augmenter `VERSION_NUMBER`, écrire `migrations/mig
 - **`listSuggestionsForContract(contractId: number, from?: string | Date, to?: string | Date): Suggestion[]`** — Liste les suggestions d’un contrat qui chevauchent éventuellement une plage.
 - **`updateSuggestion(id: number, input: { startAt: string | Date; durationMinutes: number; love: number }): Suggestion`** — Modifie une suggestion de créneau.
 - **`deleteSuggestion(id: number): void`** — Supprime une suggestion.
-- **`cleanExpiredIntervals(now: string | Date = new Date()): CleanupResult`** — Rogne les créneaux partiellement expirés et supprime ceux qui sont entièrement passés.
+- **`cleanExpiredIntervals(now: string | Date = new Date()): CleanupResult`** — Rogne les créneaux partiellement expirés et supprime ceux qui sont entièrement passés. N'est plus appelée automatiquement : les créneaux passés sont conservés.
 - **`listCompatibleSlotsForConsumer(consumerId: number, from: string | Date, to: string | Date): CompatibleSlot[]`** — Recherche les créneaux compatibles entre disponibilités et suggestions pour un consommateur.
 
 ### Réunions
