@@ -1,4 +1,4 @@
-//#region node_modules/alpinejs/dist/module.esm.js
+//#region ../../../node_modules/alpinejs/dist/module.esm.js
 var flushPending = false;
 var flushing = false;
 var queue = [];
@@ -4587,6 +4587,9 @@ var Fetcher = class {
 	scriptRuns() {
 		return this.get("/api/agent/script/runs");
 	}
+	retryScriptRun(id) {
+		return this.post(`/api/agent/script/runs/${id}/retry`, {});
+	}
 };
 var fetcher = new Fetcher();
 //#endregion
@@ -5680,6 +5683,18 @@ var raw = new class DomHandler {
 			});
 			this.scriptRuns = await fetcher.scriptRuns();
 		});
+	}
+	/** An automatic execution that did not succeed can be run again (saved code, same event). */
+	canRetryRun(r) {
+		return r.trigger === "event" && r.status !== "ok" && r.meetingId !== null;
+	}
+	async retryScriptRun(r) {
+		await this.run(async () => {
+			const next = await fetcher.retryScriptRun(r.id);
+			this.scriptRuns = await fetcher.scriptRuns();
+			this.openRun = next.id;
+			if (next.status !== "ok") throw new Error(`Nouvel essai : ${this.runStatusLabel(next.status).toLowerCase()}${next.error ? ` — ${next.error}` : "."}`);
+		}, "Nouvel essai réussi.");
 	}
 	async refreshScriptRuns() {
 		await this.load(async () => {
@@ -6822,10 +6837,6 @@ var raw = new class DomHandler {
 		const minutes = this.cal.settings.startHour * 60 + Math.floor((e.clientY - rect.top) / rect.height * this.cal.hours.length * 60 / 15) * 15;
 		const start = new Date(day);
 		start.setHours(0, minutes, 0, 0);
-		if (start.getTime() <= Date.now()) {
-			this.error = "Impossible de déplacer un créneau dans le passé.";
-			return;
-		}
 		const body = {
 			startAt: start.toISOString(),
 			durationMinutes: data.duration,
@@ -6920,11 +6931,6 @@ var raw = new class DomHandler {
 	}
 	/** A slot was drawn: the agent books a meeting when the gesture started on an availability, else adds his hours. */
 	beginInterval(start, end, origin = null) {
-		if (end.getTime() <= Date.now()) {
-			this.cal.selection = null;
-			this.error = "Ce créneau est déjà passé.";
-			return;
-		}
 		if (this.role === "agent" && origin?.kind === "dispo") {
 			this.error = "";
 			this.openBook(origin, start, end);
@@ -7017,7 +7023,6 @@ var raw = new class DomHandler {
 			if (Number.isNaN(start.getTime())) throw new Error("La date de début est invalide.");
 			if (!Number.isInteger(duration) || duration <= 0) throw new Error("La durée doit être un nombre entier de minutes.");
 			if (!(love >= 0 && love <= 1)) throw new Error("La préférence doit être comprise entre 0 et 1.");
-			if (start.getTime() + duration * 6e4 <= Date.now()) throw new Error("Ce créneau est déjà passé.");
 			if (f.repeat && duration > 1440) throw new Error("Un créneau répété dure 24 h au plus.");
 		})) return;
 		const body = {
@@ -7141,7 +7146,6 @@ var raw = new class DomHandler {
 		const duration = Number(f.duration);
 		if (!this.check(() => {
 			if (Number.isNaN(start.getTime()) || !Number.isInteger(duration) || duration <= 0) throw new Error("Date ou durée invalide.");
-			if (start.getTime() <= Date.now()) throw new Error("Un rendez-vous doit commencer dans le futur.");
 			const ev = p.ev;
 			const end = start.getTime() + duration * 6e4;
 			const related = [...this.dispos, ...this.virtualDispos].filter((d) => d.assignationId === f.assignationId && d.requestId === ev.raw.requestId).map((d) => ({
