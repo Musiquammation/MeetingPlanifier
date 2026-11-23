@@ -38,7 +38,7 @@ if (Number(process.env.USE_HTTPS)) {
 	server = http.createServer(app);
 }
 
-server.listen(port, () => {
+server.listen(port, process.env.HOSTNAME, () => {
 	const protocol = server instanceof https.Server ? "https" : "http";
 	console.log(`Server listening on ${protocol}://localhost:${port}`);
 });
