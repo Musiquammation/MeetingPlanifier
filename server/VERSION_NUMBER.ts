@@ -5,5 +5,6 @@
  *
  *   1: v1.0.0
  *   2: v1.1.0 (habits, actual duration of meetings)
+ *   3: context of userscript executions (retry)
  */
-export const VERSION_NUMBER = 2;
+export const VERSION_NUMBER = 3;

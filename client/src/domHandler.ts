@@ -635,6 +635,20 @@ export class DomHandler {
 		});
 	}
 
+	/** An automatic execution that did not succeed can be run again (saved code, same event). */
+	canRetryRun(r: ScriptRun): boolean {
+		return r.trigger === "event" && r.status !== "ok" && r.meetingId !== null;
+	}
+
+	async retryScriptRun(r: ScriptRun) {
+		await this.run(async () => {
+			const next = await fetcher.retryScriptRun(r.id);
+			this.scriptRuns = await fetcher.scriptRuns();
+			this.openRun = next.id;
+			if (next.status !== "ok") throw new Error(`Nouvel essai : ${this.runStatusLabel(next.status).toLowerCase()}${next.error ? ` — ${next.error}` : "."}`);
+		}, "Nouvel essai réussi.");
+	}
+
 	async refreshScriptRuns() {
 		await this.load(async () => { this.scriptRuns = await fetcher.scriptRuns(); });
 	}

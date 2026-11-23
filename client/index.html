@@ -762,7 +762,10 @@
 											<td x-text="r.trigger === 'test' ? 'Test' : 'Automatique'"></td>
 											<td x-text="runStatusLabel(r.status)"></td>
 											<td x-text="r.durationMs + ' ms'"></td>
-											<td><button type="button" @click="openRun = openRun === r.id ? null : r.id" :aria-expanded="openRun === r.id" x-text="openRun === r.id ? 'Masquer' : 'Détails'"></button></td>
+											<td><div data-actions>
+												<button type="button" @click="openRun = openRun === r.id ? null : r.id" :aria-expanded="openRun === r.id" x-text="openRun === r.id ? 'Masquer' : 'Détails'"></button>
+												<template x-if="canRetryRun(r)"><button type="button" data-variant="auto" @click="retryScriptRun(r)" :disabled="busy" :aria-label="'Réessayer l’exécution du ' + fmt(r.createdAt)">Réessayer</button></template>
+											</div></td>
 										</tr>
 									</template>
 								</tbody>

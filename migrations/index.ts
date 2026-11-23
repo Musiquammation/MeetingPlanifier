@@ -6,6 +6,7 @@
 //   4. update Database.SCHEMA_SQL too, so that a new database gets the final schema directly.
 // Each migration runs in a transaction; a copy of the database is made before the first one.
 import migration2 from "./migration_2";
+import migration3 from "./migration_3";
 
 export interface MigrationTools {
 	/** Runs SQL. */
@@ -21,4 +22,4 @@ export interface Migration {
 	up(tools: MigrationTools): void;
 }
 
-export const MIGRATIONS: Migration[] = [migration2];
+export const MIGRATIONS: Migration[] = [migration2, migration3];

@@ -176,6 +176,7 @@ export class Fetcher {
 	/** Runs the code (unsaved draft) on one of my meetings, or on a sample event when meetingId is null. */
 	testScript(b: { type: string; code: string; meetingId: number | null }) { return this.post<ScriptRun>("/api/agent/script/test", b); }
 	scriptRuns() { return this.get<ScriptRun[]>("/api/agent/script/runs"); }
+	retryScriptRun(id: number) { return this.post<ScriptRun>(`/api/agent/script/runs/${id}/retry`, {}); }
 }
 
 export const fetcher = new Fetcher();

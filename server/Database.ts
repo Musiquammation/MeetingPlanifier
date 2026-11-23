@@ -327,7 +327,14 @@ export interface AgentScriptRun {
   logs: string[];
   result: string | null;
   error: string | null;
+  /** Actor and changes of the event that triggered the run (null for tests and older runs). */
+  eventContext: AgentScriptRunContext | null;
   createdAt: string;
+}
+
+export interface AgentScriptRunContext {
+  actorRole: "admin" | "agent" | "consumer" | null;
+  changes: Record<string, { from: unknown; to: unknown }> | null;
 }
 
 export interface UserscriptMeetingContext {
@@ -633,6 +640,7 @@ CREATE TABLE IF NOT EXISTS agent_script_runs (
   logs TEXT NOT NULL DEFAULT '[]',
   result TEXT,
   error TEXT,
+  event_context TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
@@ -2927,10 +2935,10 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   return this.withTransaction(() => {
     const now = this.nowIso();
     const result = this.connection.prepare(
-    `INSERT INTO agent_script_runs (agent_id, trigger, event_type, meeting_id, status, duration_ms, logs, result, error, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO agent_script_runs (agent_id, trigger, event_type, meeting_id, status, duration_ms, logs, result, error, event_context, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(input.agentId, input.trigger, input.eventType, input.meetingId, input.status, Math.max(0, Math.round(input.durationMs)),
-    JSON.stringify(input.logs), input.result, input.error, now);
+    JSON.stringify(input.logs), input.result, input.error, input.eventContext ? JSON.stringify(input.eventContext) : null, now);
     this.connection.prepare(
     `DELETE FROM agent_script_runs WHERE agent_id = ? AND id NOT IN (
        SELECT id FROM agent_script_runs WHERE agent_id = ? ORDER BY id DESC LIMIT ?)`,
@@ -2943,18 +2951,28 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   const rows = this.connection.prepare(
     "SELECT * FROM agent_script_runs WHERE agent_id = ? ORDER BY id DESC LIMIT ?",
   ).all(agentId, limit) as RawRow[];
-  return rows.map((row) => {
-    let logs: string[] = [];
-    try { const parsed = JSON.parse(String(row.logs ?? "[]")); if (Array.isArray(parsed)) logs = parsed.map(String); } catch { logs = []; }
-    return {
+  return rows.map((row) => this.toAgentScriptRun(row));
+  }
+
+  getAgentScriptRun(agentId: number, id: number): AgentScriptRun | null {
+  const row = this.connection.prepare("SELECT * FROM agent_script_runs WHERE agent_id = ? AND id = ?").get(agentId, id) as RawRow | undefined;
+  return row ? this.toAgentScriptRun(row) : null;
+  }
+
+  private toAgentScriptRun(row: RawRow): AgentScriptRun {
+  let logs: string[] = [];
+  try { const parsed = JSON.parse(String(row.logs ?? "[]")); if (Array.isArray(parsed)) logs = parsed.map(String); } catch { logs = []; }
+  let eventContext: AgentScriptRunContext | null = null;
+  try { if (row.event_context !== null && row.event_context !== undefined) eventContext = JSON.parse(String(row.event_context)); } catch { eventContext = null; }
+  return {
     id: Number(row.id), agentId: Number(row.agent_id), trigger: String(row.trigger) as AgentScriptRun["trigger"],
     eventType: String(row.event_type), meetingId: row.meeting_id === null || row.meeting_id === undefined ? null : Number(row.meeting_id),
     status: String(row.status) as AgentScriptRun["status"], durationMs: Number(row.duration_ms), logs,
     result: row.result === null || row.result === undefined ? null : String(row.result),
     error: row.error === null || row.error === undefined ? null : String(row.error),
+    eventContext,
     createdAt: String(row.created_at),
-    };
-  });
+  };
   }
 
   /**

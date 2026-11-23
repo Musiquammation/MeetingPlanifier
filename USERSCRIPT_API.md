@@ -290,6 +290,10 @@ The agent's code is treated as hostile.
 A failing script never blocks or cancels the meeting action. Events are processed in the
 background, after the response has been sent to the user.
 
+An automatic run that did not succeed (`error`, `timeout` or `skipped`) has a **Retry** button in
+the history. It runs the **saved** code again on the same event (same type, `actor` and `changes`),
+with the **current** state of the meeting, and adds a new run to the history.
+
 ---
 
 ## Examples

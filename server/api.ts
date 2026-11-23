@@ -1002,6 +1002,12 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  return res.json(await userscripts.test(agentId, type, code, meetingId));
 	} catch (e: any) { return fail(res, 400, e.message || "Test impossible."); }
   });
+  /** Runs again, with the saved code, an automatic execution that failed (error, timeout or skipped). */
+  app.post("/api/agent/script/runs/:id/retry", agentOnly, async (req, res) => {
+	try {
+	  return res.json(await userscripts.retry(session(req).id, positiveInt(req.params.id, "id")));
+	} catch (e: any) { return fail(res, 400, e.message || "Nouvel essai impossible."); }
+  });
   app.get("/api/agent/script/runs", agentOnly, (req, res) => {
 	try { return res.json(database.listAgentScriptRuns(session(req).id)); }
 	catch (e: any) { return fail(res, 400, e.message); }

@@ -5,7 +5,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AgentScriptRun, Database, UserscriptMeetingContext } from "../Database";
+import type { AgentScriptRun, AgentScriptRunContext, Database, UserscriptMeetingContext } from "../Database";
 
 export type UserscriptEventType = "new-meeting" | "update-meeting" | "cancel-meeting" | "valid-meeting";
 export const USERSCRIPT_EVENT_TYPES: UserscriptEventType[] = ["new-meeting", "update-meeting", "cancel-meeting", "valid-meeting"];
@@ -172,7 +172,7 @@ export class UserscriptService {
 			if (!script.enabled || !script.code.trim()) return;
 			const args = this.buildArgs(type, ctx, actor, false, changes);
 			void this.execute(ctx.agent.id, script.code, script.secrets, args)
-				.then((outcome) => this.record(ctx.agent.id, "event", type, meetingId, outcome, script.secrets))
+				.then((outcome) => this.record(ctx.agent.id, "event", type, meetingId, outcome, script.secrets, { actorRole: actor.role, changes }))
 				.catch((error) => console.error("[userscript] dispatch failed:", error));
 		} catch (error) {
 			console.error("[userscript] dispatch failed:", error);
@@ -195,7 +195,30 @@ export class UserscriptService {
 		return this.record(agentId, "test", type, meetingId, outcome, script.secrets);
 	}
 
-	private record(agentId: number, trigger: "event" | "test", type: string, meetingId: number | null, outcome: Outcome, secrets: Record<string, string>): AgentScriptRun {
+	/**
+	 * Runs again an automatic execution that did not succeed: same event, same actor and changes, with the saved
+	 * code and the current state of the meeting. The new run is stored like an automatic one.
+	 */
+	async retry(agentId: number, runId: number): Promise<AgentScriptRun> {
+		const previous = this.database.getAgentScriptRun(agentId, runId);
+		if (!previous) throw new Error("Exécution introuvable.");
+		if (previous.trigger !== "event") throw new Error("Seules les exécutions automatiques peuvent être relancées.");
+		if (previous.status === "ok") throw new Error("Cette exécution a réussi : rien à relancer.");
+		if (previous.meetingId === null || !USERSCRIPT_EVENT_TYPES.includes(previous.eventType as UserscriptEventType)) throw new Error("Cette exécution ne peut pas être relancée.");
+		const ctx = this.database.getUserscriptMeetingContext(previous.meetingId);
+		if (!ctx || ctx.agent.id !== agentId) throw new Error("Le rendez-vous de cette exécution n’existe plus.");
+		const script = this.database.getAgentScript(agentId);
+		if (!script.code.trim()) throw new Error("Le script enregistré est vide.");
+		const type = previous.eventType as UserscriptEventType;
+		const context: AgentScriptRunContext = previous.eventContext ?? { actorRole: null, changes: null };
+		const actor = context.actorRole ? { role: context.actorRole } : null;
+		const changes = (context.changes ?? null) as MeetingChanges | null;
+		const args = this.buildArgs(type, ctx, actor, false, changes);
+		const outcome = await this.execute(agentId, script.code, script.secrets, args);
+		return this.record(agentId, "event", type, previous.meetingId, outcome, script.secrets, context);
+	}
+
+	private record(agentId: number, trigger: "event" | "test", type: string, meetingId: number | null, outcome: Outcome, secrets: Record<string, string>, eventContext: AgentScriptRunContext | null = null): AgentScriptRun {
 		// Secrets never end up in the stored history, even if the script logs them.
 		const values = Object.values(secrets).filter((v) => v.length >= 4).sort((a, b) => b.length - a.length);
 		const redact = (text: string | null) => text === null ? null : values.reduce((t, v) => t.split(v).join("***"), text);
@@ -203,6 +226,7 @@ export class UserscriptService {
 			agentId, trigger, eventType: type, meetingId,
 			status: outcome.status, durationMs: outcome.durationMs,
 			logs: outcome.logs.map((l) => redact(l) ?? ""), result: redact(outcome.result), error: redact(outcome.error),
+			eventContext,
 		});
 	}
 
