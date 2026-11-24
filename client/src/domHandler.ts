@@ -649,6 +649,15 @@ export class DomHandler {
 		}, "Nouvel essai réussi.");
 	}
 
+	async clearScriptRuns() {
+		if (!confirm("Effacer toutes les exécutions de la liste ?")) return;
+		await this.run(async () => {
+			await fetcher.clearScriptRuns();
+			this.scriptRuns = [];
+			this.openRun = null;
+		}, "Exécutions effacées.");
+	}
+
 	async refreshScriptRuns() {
 		await this.load(async () => { this.scriptRuns = await fetcher.scriptRuns(); });
 	}

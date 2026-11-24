@@ -12,6 +12,9 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import bcrypt from "bcryptjs";
 import { Database } from "./Database";
+import { getLogger } from "./logger";
+
+const log = getLogger("seed");
 
 const COMPANY = "Société X";
 const PASSWORD = "x";
@@ -60,7 +63,7 @@ for (const spec of CONSUMERS) {
 		fidelity = database.createFidelity(companyId, consumerId, spec.key);
 		done.push(`consumer ${spec.username}, key ${spec.key}`);
 	} else if (fidelity.key !== spec.key) {
-		console.warn(`Consumer ${spec.username} already has the key ${fidelity.key} in ${COMPANY} (expected ${spec.key}).`);
+		log.warn(`Consumer ${spec.username} already has the key ${fidelity.key} in ${COMPANY} (expected ${spec.key}).`);
 	}
 	if (fidelity.defaultPackageId !== pkg.id) database.setFidelityDefaultPackage(fidelity.id, pkg.id);
 	let assignation = database.listAssignationsForAgent(agentId).find((a) => a.fidelityId === fidelity.id);
@@ -75,7 +78,10 @@ const days = Array.from({ length: 7 }, (_, i) => {
 	day.setUTCHours(9, 0, 0, 0);
 	return day.toISOString();
 });
-const tryCreate = (create: () => unknown) => { try { create(); return 1; } catch { return 0; /* overlaps an existing interval */ } };
+const tryCreate = (create: () => unknown) => {
+	try { create(); return 1; }
+	catch (error: any) { log.debug(`Interval skipped: ${error?.message ?? error}`); return 0; /* overlaps an existing interval */ }
+};
 let created = 0;
 for (const assignationId of assignations) {
 	const requestId = database.listAvailabilityRequestsForAssignation(assignationId).find((r) => r.status !== "closed")?.id
@@ -93,7 +99,7 @@ if (created) done.push(`${created} availability / suggestion intervals`);
 database.saveAgentScript(agentId, { code: readFileSync(SCRIPT_FILE, "utf8"), enabled: true });
 const missing = ["SHEET_URL", "GOOGLE_SERVICE_ACCOUNT"].filter((name) => !(name in database.getAgentScript(agentId).secrets));
 done.push(`script of X: google-sheet-meetings.js (enabled)`);
-if (missing.length) console.warn(`Secrets to set by X in the Script menu (#agent-script): ${missing.join(", ")}.`);
+if (missing.length) log.warn(`Secrets to set by X in the Script menu (#agent-script): ${missing.join(", ")}.`);
 
 database.close();
-console.log(["Seed done:", ...done.map((line) => `  - ${line}`)].join("\n"));
+log.info(["Seed done:", ...done.map((line) => `  - ${line}`)].join("\n"));

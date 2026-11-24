@@ -748,7 +748,10 @@
 					</template>
 
 					<h2>Dernières exécutions</h2>
-					<p data-actions><button type="button" @click="refreshScriptRuns()" :disabled="loading">Actualiser</button></p>
+					<p data-actions>
+						<button type="button" @click="refreshScriptRuns()" :disabled="loading">Actualiser</button>
+						<button type="button" data-variant="danger" @click="clearScriptRuns()" :disabled="busy || !scriptRuns.length">Tout effacer</button>
+					</p>
 					<template x-if="!scriptRuns.length"><p>Aucune exécution pour l’instant.</p></template>
 					<template x-if="scriptRuns.length">
 						<div role="region" tabindex="0" aria-label="Dernières exécutions">

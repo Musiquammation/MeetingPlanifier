@@ -2,11 +2,16 @@ import type { Express, Request, Response, NextFunction } from "express";
 import express from "express";
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
+import { getLogger } from "./logger";
 import { DEFAULT_LIMITS, USERSCRIPT_EVENT_TYPES, UserscriptService, type MeetingChanges, type UserscriptEventType } from "./userscript/UserscriptService";
 
 type Role = "admin" | "agent" | "consumer";
 type Session = { role: Role; id: number; companyId?: number; expiresAt: number };
 type Db = Record<string, any>;
+
+const log = getLogger("api");
+const httpLog = getLogger("http");
+const authLog = getLogger("auth");
 
 const sessions = new Map<string, Session>();
 /** Hours of the implicit request created when a consumer gives availabilities without stating hours. */
@@ -14,6 +19,8 @@ const UNLIMITED_HOURS = 1000;
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 
 function fail(res: Response, status: number, message: string) {
+  // Picked up by the request logger, so the line of the request says why it failed.
+  res.locals.errorMessage = message;
   return res.status(status).json({ error: message });
 }
 function requiredString(value: unknown, label: string, max = 200): string {
@@ -65,7 +72,24 @@ function intervalInput(body: any) {
  * Le paramètre database est une instance de la classe Database documentée dans le projet.
  */
 export function initApi(app: Express, database: Db, userscripts: UserscriptService = new UserscriptService(database as any)): void {
+  // One line per request (never the body: it may hold passwords, keys or secrets).
+  app.use((req, res, next) => {
+	const started = process.hrtime.bigint();
+	res.on("finish", () => {
+	  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+	  const who = (req as any).session ? ` ${(req as any).session.role}#${(req as any).session.id}` : "";
+	  const reason = res.locals.errorMessage ? ` - ${res.locals.errorMessage}` : "";
+	  const line = `${req.method} ${req.path} ${res.statusCode} ${ms.toFixed(1)} ms${who}${reason}`;
+	  if (res.statusCode >= 500) httpLog.error(line);
+	  else if (res.statusCode === 401) httpLog.info(line);
+	  else if (res.statusCode >= 400) httpLog.warn(line);
+	  else if (req.path === "/api/health") httpLog.debug(line);
+	  else httpLog.info(line);
+	});
+	next();
+  });
   app.use(express.json({ limit: "256kb" }));
+  log.info("Registering the API routes");
 
   app.get("/api/health", (_req, res) => {
 	try { return res.json(database.healthCheck()); }
@@ -76,10 +100,15 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	const token = (req.header("authorization") || "").replace(/^Bearer\s+/i, "");
 	const session = sessions.get(token);
 	if (!session || session.expiresAt <= Date.now()) {
+	  if (session) authLog.info(`Session of ${session.role}#${session.id} expired`);
+	  else authLog.debug(`${req.method} ${req.path}: ${token ? "unknown token" : "no token"}`);
 	  if (token) sessions.delete(token);
 	  return fail(res, 401, "Session absente ou expirée.");
 	}
-	if (roles && !roles.includes(session.role)) return fail(res, 403, "Droits insuffisants.");
+	if (roles && !roles.includes(session.role)) {
+	  authLog.warn(`${session.role}#${session.id} denied on ${req.method} ${req.path} (needs ${roles.join("/")})`);
+	  return fail(res, 403, "Droits insuffisants.");
+	}
 	(req as any).session = session;
 	(req as any).token = token;
 	next();
@@ -87,6 +116,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
   const issueSession = (role: Role, id: number, companyId?: number) => {
 	const token = crypto.randomBytes(32).toString("base64url");
 	sessions.set(token, { role, id, companyId, expiresAt: Date.now() + SESSION_TTL_MS });
+	authLog.info(`Session opened for ${role}#${id}${companyId !== undefined ? ` (company ${companyId})` : ""}, ${sessions.size} active`);
 	return token;
   };
   const session = (req: Request): Session => (req as any).session;
@@ -99,6 +129,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  const companyName = requiredString(req.body.companyName, "companyName", 120);
 	  const passwordHash = requirePasswordHash(password);
 	  const result = database.createAdminWithCompany({ username, passwordHash, displayName, companyName, level: 100 });
+	  authLog.info(`Admin signup: "${username}" (company "${companyName}")`);
 	  const token = issueSession("admin", result.admin.id, result.company.id);
 	  return res.status(201).json({ token, user: result.admin, company: result.company });
 	} catch (e: any) { return fail(res, 400, e.message || "Inscription impossible."); }
@@ -110,6 +141,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  const password = requiredString(req.body.password, "password", 200);
 	  const credentials = database.getAdminCredentialsByUsername(username);
 	  if (!credentials || !verifyPassword(password, credentials.passwordHash ?? credentials.password_hash)) {
+		authLog.warn(`Failed admin login for "${username}" from ${req.ip}`);
 		return fail(res, 401, "Identifiants invalides.");
 	  }
 	  const company = database.getCompanyForAdmin(credentials.id);
@@ -124,6 +156,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  const password = requiredString(req.body.password, "password", 200);
 	  const credentials = database.getAgentCredentialsByUsername(username);
 	  if (!credentials || !verifyPassword(password, credentials.passwordHash ?? credentials.password_hash)) {
+		authLog.warn(`Failed agent login for "${username}" from ${req.ip}`);
 		return fail(res, 401, "Identifiants invalides.");
 	  }
 	  const token = issueSession("agent", credentials.id);
@@ -138,11 +171,15 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	try {
 	  const key = requiredString(req.body.key, "key", 6);
 	  const fidelity = database.getFidelityByAccessKey(key);
-	  if (!fidelity || fidelity.active === false) return fail(res, 401, "Clé ou mot de passe invalide.");
+	  if (!fidelity || fidelity.active === false) {
+		authLog.warn(`Consumer access refused: ${fidelity ? "inactive" : "unknown"} key from ${req.ip}`);
+		return fail(res, 401, "Clé ou mot de passe invalide.");
+	  }
 	  const credentials = database.getConsumerCredentialsById(fidelity.consumerId ?? fidelity.consumer_id);
 	  if (!credentials) return fail(res, 401, "Clé ou mot de passe invalide.");
 	  const hash = credentials.passwordHash ?? credentials.password_hash;
 	  if (hash && (typeof req.body.password !== "string" || !verifyPassword(req.body.password, hash))) {
+		authLog.warn(`Consumer access refused: wrong password for consumer#${credentials.id} from ${req.ip}`);
 		return fail(res, 401, "Clé ou mot de passe invalide.");
 	  }
 	  const token = issueSession("consumer", credentials.id);
@@ -157,7 +194,9 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	return res.json({ role: s.role, user, companyId: s.companyId });
   });
   app.post("/api/logout", auth(), (req, res) => {
+	const s = session(req);
 	sessions.delete((req as any).token);
+	authLog.info(`Logout of ${s.role}#${s.id}, ${sessions.size} active`);
 	return res.json({ ok: true });
   });
 
@@ -794,7 +833,10 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 						: undefined
 			});
 
-			if (!result.alreadyExisted) userscripts.dispatch("new-meeting", result.meeting.id, { role: "agent" });
+			if (!result.alreadyExisted) {
+				log.info(`Agent ${agentId} booked meeting ${result.meeting.id} (assignation ${assignationId}, ${startAt}, ${durationMinutes} min)`);
+				userscripts.dispatch("new-meeting", result.meeting.id, { role: "agent" });
+			} else log.debug(`Agent ${agentId}: meeting ${result.meeting.id} already existed (idempotent request)`);
 
 			return res.status(201).json({
 				...result,
@@ -804,6 +846,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 				)
 			});
 		} catch (e: any) {
+			log.info(`Meeting booking refused: ${e?.message ?? e}`);
 			return fail(
 				res,
 				409,
@@ -833,8 +876,10 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  if ((before.roomName ?? null) !== (meeting.roomName ?? null)) changes.room = { from: before.roomName ?? null, to: meeting.roomName ?? null };
 	  if (before.comment !== meeting.comment) changes.comment = { from: before.comment, to: meeting.comment };
 	  if (Object.keys(changes).length) userscripts.dispatch("update-meeting", id, { role: s.role }, changes);
+	  if (Object.keys(changes).length) log.info(`Meeting ${id} updated by ${s.role}#${s.id}: ${Object.keys(changes).join(", ")}`);
 	  if (req.body.status === "done") {
 		meeting = database.markMeetingDone(id, actualDuration);
+		log.info(`Meeting ${id} validated by ${s.role}#${s.id}${actualDuration !== null ? ` (${actualDuration} min)` : ""}`);
 		userscripts.dispatch("valid-meeting", id, { role: s.role });
 	  }
 	  return res.json(meetingForRole(meeting, s.role));
@@ -850,6 +895,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  if (s.role === "consumer" && !database.listAssignationsForConsumer(s.id).some((a: any) => a.id === (meeting.assignationId ?? meeting.assignation_id))) return fail(res, 403, "Réunion inaccessible.");
 	  const wasPending = meeting.status === "pending";
 	  const canceled = database.cancelMeeting(id, s.role, s.id);
+	  log.info(`Meeting ${id} canceled by ${s.role}#${s.id} (was ${meeting.status})`);
 	  if (wasPending) userscripts.dispatch("cancel-meeting", id, { role: s.role });
 	  return res.json(meetingForRole(canceled, s.role));
 	} catch (e: any) { return fail(res, 400, e.message); }
@@ -974,6 +1020,7 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 	  const code = req.body.code === undefined ? undefined : codeInput(req.body.code);
 	  if (req.body.enabled !== undefined && typeof req.body.enabled !== "boolean") return fail(res, 400, "enabled doit être un booléen.");
 	  database.saveAgentScript(session(req).id, { code, enabled: req.body.enabled });
+	  getLogger("userscript").info(`Agent ${session(req).id} saved the script${code !== undefined ? ` (${code.length} chars)` : ""}${req.body.enabled !== undefined ? `, ${req.body.enabled ? "enabled" : "disabled"}` : ""}`);
 	  return res.json(scriptView(session(req).id));
 	} catch (e: any) { return fail(res, 400, e.message || "Enregistrement impossible."); }
   });
@@ -988,6 +1035,8 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
 		changes[name] = item.value;
 	  }
 	  database.updateAgentScriptSecrets(session(req).id, changes);
+	  // Names only: the values never reach the logs.
+	  getLogger("userscript").info(`Agent ${session(req).id} updated secrets: ${Object.entries(changes).map(([n, v]) => `${n}${v === null ? " (removed)" : ""}`).join(", ")}`);
 	  return res.json(scriptView(session(req).id));
 	} catch (e: any) { return fail(res, 400, e.message || "Enregistrement impossible."); }
   });
@@ -1010,6 +1059,15 @@ export function initApi(app: Express, database: Db, userscripts: UserscriptServi
   app.get("/api/agent/script/runs", agentOnly, (req, res) => {
 	try { return res.json(database.listAgentScriptRuns(session(req).id)); }
 	catch (e: any) { return fail(res, 400, e.message); }
+  });
+  /** Empties the list of executions of the agent. */
+  app.delete("/api/agent/script/runs", agentOnly, (req, res) => {
+	try {
+	  const agentId = session(req).id;
+	  const deleted = database.clearAgentScriptRuns(agentId);
+	  getLogger("userscript").info(`Agent ${agentId} cleared ${deleted} execution(s)`);
+	  return res.json({ deleted });
+	} catch (e: any) { return fail(res, 400, e.message || "Effacement impossible."); }
   });
 }
 

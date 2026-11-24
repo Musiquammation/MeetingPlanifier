@@ -6,6 +6,9 @@ import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentScriptRun, AgentScriptRunContext, Database, UserscriptMeetingContext } from "../Database";
+import { getLogger } from "../logger";
+
+const log = getLogger("userscript");
 
 export type UserscriptEventType = "new-meeting" | "update-meeting" | "cancel-meeting" | "valid-meeting";
 export const USERSCRIPT_EVENT_TYPES: UserscriptEventType[] = ["new-meeting", "update-meeting", "cancel-meeting", "valid-meeting"];
@@ -54,6 +57,12 @@ const RUNNER = resolve(here, "runner.mjs");
 const requireHere = createRequire(import.meta.url);
 /** Native binary of isolated-vm, loaded directly by the runner (see runner.mjs). */
 const ISOLATED_VM_BINARY: string = requireHere("node-gyp-build").path(dirname(requireHere.resolve("isolated-vm/package.json")));
+
+/**
+ * Flag that turns on Node's permission model: "--experimental-permission" until Node 23.4, "--permission" since
+ * (Node 24 refuses the old name with "bad option"). The one this Node accepts is chosen at start-up.
+ */
+const PERMISSION_FLAG = process.allowedNodeEnvironmentFlags.has("--permission") ? "--permission" : "--experimental-permission";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 const addMinutes = (iso: string, minutes: number) => new Date(Date.parse(iso) + minutes * 60000).toISOString();
@@ -167,15 +176,19 @@ export class UserscriptService {
 	dispatch(type: UserscriptEventType, meetingId: number, actor: Actor, changes: MeetingChanges | null = null): void {
 		try {
 			const ctx = this.database.getUserscriptMeetingContext(meetingId);
-			if (!ctx) return;
+			if (!ctx) { log.warn(`${type} on meeting ${meetingId}: meeting context not found, nothing dispatched`); return; }
 			const script = this.database.getAgentScript(ctx.agent.id);
-			if (!script.enabled || !script.code.trim()) return;
+			if (!script.enabled || !script.code.trim()) {
+				log.debug(`${type} on meeting ${meetingId}: script of agent ${ctx.agent.id} ${script.enabled ? "empty" : "disabled"}, not run`);
+				return;
+			}
+			log.info(`Dispatching ${type} on meeting ${meetingId} to agent ${ctx.agent.id} (by ${actor.role})`);
 			const args = this.buildArgs(type, ctx, actor, false, changes);
 			void this.execute(ctx.agent.id, script.code, script.secrets, args)
 				.then((outcome) => this.record(ctx.agent.id, "event", type, meetingId, outcome, script.secrets, { actorRole: actor.role, changes }))
-				.catch((error) => console.error("[userscript] dispatch failed:", error));
+				.catch((error) => log.error(`Dispatch of ${type} on meeting ${meetingId} failed:`, error));
 		} catch (error) {
-			console.error("[userscript] dispatch failed:", error);
+			log.error(`Dispatch of ${type} on meeting ${meetingId} failed:`, error);
 		}
 	}
 
@@ -191,6 +204,7 @@ export class UserscriptService {
 		} else {
 			args = this.sampleArgs(type, agentId);
 		}
+		log.info(`Test of ${type} by agent ${agentId} (${meetingId === null ? "sample event" : `meeting ${meetingId}`})`);
 		const outcome = await this.execute(agentId, code, script.secrets, args);
 		return this.record(agentId, "test", type, meetingId, outcome, script.secrets);
 	}
@@ -214,6 +228,7 @@ export class UserscriptService {
 		const actor = context.actorRole ? { role: context.actorRole } : null;
 		const changes = (context.changes ?? null) as MeetingChanges | null;
 		const args = this.buildArgs(type, ctx, actor, false, changes);
+		log.info(`Retry of run ${runId} (${type} on meeting ${previous.meetingId}) by agent ${agentId}`);
 		const outcome = await this.execute(agentId, script.code, script.secrets, args);
 		return this.record(agentId, "event", type, previous.meetingId, outcome, script.secrets, context);
 	}
@@ -222,6 +237,10 @@ export class UserscriptService {
 		// Secrets never end up in the stored history, even if the script logs them.
 		const values = Object.values(secrets).filter((v) => v.length >= 4).sort((a, b) => b.length - a.length);
 		const redact = (text: string | null) => text === null ? null : values.reduce((t, v) => t.split(v).join("***"), text);
+		const summary = `Agent ${agentId}, ${trigger} ${type}${meetingId !== null ? ` on meeting ${meetingId}` : ""}: ${outcome.status} in ${outcome.durationMs} ms`;
+		if (outcome.status === "ok") log.info(summary);
+		else log.warn(`${summary}${outcome.error ? ` - ${redact(outcome.error)}` : ""}`);
+		if (outcome.logs.length) log.debug(`${summary}, ${outcome.logs.length} log line(s)`);
 		return this.database.addAgentScriptRun({
 			agentId, trigger, eventType: type, meetingId,
 			status: outcome.status, durationMs: outcome.durationMs,
@@ -233,6 +252,7 @@ export class UserscriptService {
 	private async execute(agentId: number, code: string, secrets: Record<string, string>, args: Record<string, unknown>): Promise<Outcome> {
 		const queued = this.queuedPerAgent.get(agentId) ?? 0;
 		if (queued >= this.maxQueuedPerAgent) {
+			log.warn(`Agent ${agentId}: ${queued} executions already waiting, this one is skipped`);
 			return { status: "skipped", result: null, logs: [], error: "Too many executions waiting for this agent: this one was skipped.", durationMs: 0 };
 		}
 		this.queuedPerAgent.set(agentId, queued + 1);
@@ -257,6 +277,7 @@ export class UserscriptService {
 
 	private acquire(): Promise<void> {
 		if (this.running < this.maxConcurrent) { this.running += 1; return Promise.resolve(); }
+		log.debug(`All ${this.maxConcurrent} sandbox slots busy, waiting (${this.queue.length + 1} in queue)`);
 		return new Promise((resolveSlot) => this.queue.push(() => { this.running += 1; resolveSlot(); }));
 	}
 
@@ -287,7 +308,7 @@ export class UserscriptService {
 						"--no-node-snapshot", // required by isolated-vm on Node >= 20
 						`--max-old-space-size=${Math.max(64, limits.memoryMb * 4)}`,
 						// Node permission model: no file writes, no child process, no worker; only the runner and isolated-vm can be read.
-						"--experimental-permission",
+						PERMISSION_FLAG,
 						"--allow-addons",
 						"--no-warnings",
 						`--allow-fs-read=${RUNNER}`,
@@ -297,19 +318,29 @@ export class UserscriptService {
 					serialization: "advanced",
 				});
 			} catch (error: any) {
+				log.error("Cannot start the sandbox:", error);
 				resolveOutcome({ status: "error", result: null, logs: [], error: `Cannot start the sandbox: ${error?.message ?? error}`, durationMs: 0 });
 				return;
 			}
-			const killer = setTimeout(() => finish({
-				status: "timeout", result: null, logs: [], error: `Execution exceeded the time limit (${limits.wallTimeMs} ms)`, durationMs: Date.now() - started,
-			}), limits.wallTimeMs + 2000);
+			const killer = setTimeout(() => {
+				log.warn(`Sandbox (pid ${child.pid}) exceeded ${limits.wallTimeMs} ms: killed`);
+				finish({
+					status: "timeout", result: null, logs: [], error: `Execution exceeded the time limit (${limits.wallTimeMs} ms)`, durationMs: Date.now() - started,
+				});
+			}, limits.wallTimeMs + 2000);
+			log.debug(`Sandbox started (pid ${child.pid}, ${PERMISSION_FLAG})`);
 			let stderr = "";
 			child.stderr?.on("data", (chunk) => { if (stderr.length < 4000) stderr += String(chunk); });
 			child.on("message", (message: any) => {
 				if (message?.type === "ready") child.send({ code, secrets, args, limits });
 				else if (message?.type === "result") finish(message.outcome as Outcome);
 			});
+			child.on("error", (error) => log.error("Sandbox process error:", error));
 			child.on("error", (error) => finish({ status: "error", result: null, logs: [], error: `Sandbox error: ${error.message}`, durationMs: Date.now() - started }));
+			child.on("exit", (exitCode, signal) => {
+				if (!settled) log.error(`Sandbox (pid ${child.pid}) stopped unexpectedly (${signal ?? `code ${exitCode}`})${stderr ? `: ${stderr.trim().slice(0, 1000)}` : ""}`);
+				else log.debug(`Sandbox (pid ${child.pid}) exited (${signal ?? `code ${exitCode}`})`);
+			});
 			child.on("exit", (exitCode, signal) => finish({
 				status: "error", result: null, logs: [],
 				error: `Sandbox stopped unexpectedly (${signal ?? `code ${exitCode}`})${stderr ? `: ${stderr.trim().slice(0, 1000)}` : ""}`,

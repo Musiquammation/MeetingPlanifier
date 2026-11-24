@@ -5,6 +5,9 @@ import { DatabaseSync } from "node:sqlite";
 import { DATE_RE, isValidTimeZone, occurrences, zonedTime } from "../shared/recurrence";
 import { MIGRATIONS } from "../migrations/index";
 import { VERSION_NUMBER } from "./VERSION_NUMBER";
+import { getLogger } from "./logger";
+
+const log = getLogger("database");
 
 export type MeetingStatus = "pending" | "done" | "canceledBy";
 export type AgentStatus = "pending" | "active" | "disabled";
@@ -729,10 +732,17 @@ END;
     mkdirSync(dirname(fullPath), { recursive: true });
     this.databasePath = fullPath;
   }
-  this.connection = new DatabaseSync(this.databasePath);
-  this.connection.exec("PRAGMA foreign_keys = ON;");
-  this.connection.exec("PRAGMA busy_timeout = 5000;");
-  this.initialize();
+  log.info(`Opening ${this.databasePath}`);
+  try {
+    this.connection = new DatabaseSync(this.databasePath);
+    this.connection.exec("PRAGMA foreign_keys = ON;");
+    this.connection.exec("PRAGMA busy_timeout = 5000;");
+    this.initialize();
+  } catch (error) {
+    log.critical(`Cannot open or initialize the database ${this.databasePath}:`, error);
+    throw error;
+  }
+  log.info(`Database ready (${this.databasePath})`);
   }
 
   /**
@@ -781,6 +791,7 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   const content = existsSync(file) ? readFileSync(file, "utf8").trim() : null;
   let version: number;
   if (content === "" || (content === null && !existed)) {
+    log.info(`New database: data version set to ${VERSION_NUMBER}`);
     write(VERSION_NUMBER);
     return;
   }
@@ -790,9 +801,14 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
     if (!Number.isInteger(version) || version < 1) throw new Error(`${file} must contain a version number (found "${content}")`);
   }
   if (version > VERSION_NUMBER) {
+    log.critical(`The data is at version ${version} but this code expects ${VERSION_NUMBER}`);
     throw new Error(`The database is at version ${version} but this code expects ${VERSION_NUMBER}: update the server`);
   }
-  if (version === VERSION_NUMBER) { if (content === null) write(version); return; }
+  if (version === VERSION_NUMBER) {
+    log.debug(`Data already at version ${version}`);
+    if (content === null) write(version);
+    return;
+  }
 
   const todo = MIGRATIONS.filter((m) => m.version > version && m.version <= VERSION_NUMBER).sort((a, b) => a.version - b.version);
   for (let v = version + 1; v <= VERSION_NUMBER; v += 1) {
@@ -801,7 +817,7 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "");
   const backup = this.databasePath.replace(/(\.sqlite)?$/, `.before-v${VERSION_NUMBER}.${stamp}.sqlite`);
   this.connection.prepare("VACUUM INTO ?").run(backup);
-  console.log(`[database] version ${version} -> ${VERSION_NUMBER}, backup: ${backup}`);
+  log.info(`Data version ${version} -> ${VERSION_NUMBER}, backup: ${backup}`);
 
   const hasColumn = (table: string, column: string): boolean =>
     (this.connection.prepare(`PRAGMA table_info(${table})`).all() as RawRow[]).some((row) => String(row.name) === column);
@@ -813,9 +829,15 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
     },
   };
   for (const migration of todo) {
+    log.info(`Running migration ${migration.version}: ${migration.description}`);
+    try {
     this.withTransaction(() => migration.up(tools));
+    } catch (error) {
+    log.critical(`Migration ${migration.version} failed (data left at version ${migration.version - 1}, backup: ${backup}):`, error);
+    throw error;
+    }
     write(migration.version);
-    console.log(`[database] migration ${migration.version} done: ${migration.description}`);
+    log.info(`Migration ${migration.version} done`);
   }
   }
 
@@ -875,6 +897,7 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
     return result;
   } catch (error) {
     this.transactionDepth = depth;
+    log.debug(`Transaction rolled back (depth ${depth}): ${(error as any)?.message ?? error}`);
     try {
     if (depth === 0) {
       this.connection.exec("ROLLBACK;");
@@ -882,8 +905,9 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
       this.connection.exec(`ROLLBACK TO SAVEPOINT ${savepoint};`);
       this.connection.exec(`RELEASE SAVEPOINT ${savepoint};`);
     }
-    } catch {
+    } catch (rollbackError) {
     // Preserve the original failure if rollback itself fails.
+    log.error("Rollback failed:", rollbackError);
     }
     throw error;
   }
@@ -898,6 +922,7 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
 
   close(): void {
   if (!this.closed) {
+    log.info(`Closing ${this.databasePath}`);
     this.connection.close();
     this.closed = true;
   }
@@ -2943,6 +2968,13 @@ CREATE INDEX IF NOT EXISTS idx_suggestions_generator ON suggestions(generator_id
     "SELECT * FROM agent_script_runs WHERE agent_id = ? ORDER BY id DESC LIMIT ?",
   ).all(agentId, limit) as RawRow[];
   return rows.map((row) => this.toAgentScriptRun(row));
+  }
+
+  /** Delete every stored execution of the agent; returns how many were deleted. */
+  clearAgentScriptRuns(agentId: number): number {
+  this.ensureOpen();
+  const result = this.connection.prepare("DELETE FROM agent_script_runs WHERE agent_id = ?").run(agentId);
+  return Number(result.changes);
   }
 
   getAgentScriptRun(agentId: number, id: number): AgentScriptRun | null {

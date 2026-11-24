@@ -177,6 +177,8 @@ export class Fetcher {
 	testScript(b: { type: string; code: string; meetingId: number | null }) { return this.post<ScriptRun>("/api/agent/script/test", b); }
 	scriptRuns() { return this.get<ScriptRun[]>("/api/agent/script/runs"); }
 	retryScriptRun(id: number) { return this.post<ScriptRun>(`/api/agent/script/runs/${id}/retry`, {}); }
+	/** Empties the list of my executions. */
+	clearScriptRuns() { return this.del<{ deleted: number }>("/api/agent/script/runs"); }
 }
 
 export const fetcher = new Fetcher();
